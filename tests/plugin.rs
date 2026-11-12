@@ -268,6 +268,110 @@ fn bypass_still_publishes_meters() {
     assertions::assert_meter_above(&result, params.meter_r.id(), 0.4);
 }
 
+#[test]
+fn mid_only_collapses_cluster_to_identical_channels() {
+    let result = driver!(Plugin)
+        .sample_rate(48_000.0)
+        .channels(2)
+        .duration(Duration::from_millis(300))
+        .input(tone())
+        .set_param(P::MidOnly, 1.0)
+        .run();
+
+    let max_diff = result.output[0]
+        .iter()
+        .zip(&result.output[1])
+        .fold(0.0_f32, |m, (l, r)| m.max((l - r).abs()));
+    assert!(
+        max_diff < 1e-6,
+        "MidOnly=1 must yield identical L and R channels: {max_diff}"
+    );
+}
+
+#[test]
+fn side_hpf_reaches_the_dsp() {
+    let low_hpf = driver!(Plugin)
+        .sample_rate(48_000.0)
+        .channels(2)
+        .duration(Duration::from_millis(200))
+        .input(tone())
+        .set_param(P::SideHpf, 0.0) // 20 Hz
+        .run();
+
+    let high_hpf = driver!(Plugin)
+        .sample_rate(48_000.0)
+        .channels(2)
+        .duration(Duration::from_millis(200))
+        .input(tone())
+        .set_param(P::SideHpf, 1.0) // 300 Hz
+        .run();
+
+    let max_diff = low_hpf.output[0]
+        .iter()
+        .zip(&high_hpf.output[0])
+        .fold(0.0_f32, |m, (a, b)| m.max((a - b).abs()));
+    assert!(
+        max_diff > 1e-4,
+        "Side HPF parameter must reach the DSP: {max_diff}"
+    );
+}
+
+#[test]
+fn air_shelf_reaches_the_dsp() {
+    let air_off = driver!(Plugin)
+        .sample_rate(48_000.0)
+        .channels(2)
+        .duration(Duration::from_millis(200))
+        .input(tone())
+        .set_param(P::Air, 0.0) // 0 dB
+        .run();
+
+    let air_on = driver!(Plugin)
+        .sample_rate(48_000.0)
+        .channels(2)
+        .duration(Duration::from_millis(200))
+        .input(tone())
+        .set_param(P::Air, 1.0) // +6 dB
+        .run();
+
+    let max_diff = air_off.output[0]
+        .iter()
+        .zip(&air_on.output[0])
+        .fold(0.0_f32, |m, (a, b)| m.max((a - b).abs()));
+    assert!(
+        max_diff > 1e-4,
+        "Air shelf parameter must reach the DSP: {max_diff}"
+    );
+}
+
+#[test]
+fn voice_level_reaches_the_dsp() {
+    let quiet = driver!(Plugin)
+        .sample_rate(48_000.0)
+        .channels(2)
+        .duration(Duration::from_millis(200))
+        .input(tone())
+        .set_param(P::VoiceLevel, 0.0) // -24 dB
+        .run();
+
+    let loud = driver!(Plugin)
+        .sample_rate(48_000.0)
+        .channels(2)
+        .duration(Duration::from_millis(200))
+        .input(tone())
+        .set_param(P::VoiceLevel, 1.0) // +6 dB
+        .run();
+
+    let max_diff = quiet.output[0]
+        .iter()
+        .zip(&loud.output[0])
+        .fold(0.0_f32, |m, (a, b)| m.max((a - b).abs()));
+    assert!(
+        max_diff > 1e-3,
+        "Voice Level parameter must reach the DSP: {max_diff}"
+    );
+}
+
 #[cfg(feature = "rt-paranoid")]
 #[test]
 fn process_never_allocates() {
