@@ -1,8 +1,20 @@
-//! One thickened voice: a fixed detune / delay / pan assignment plus a
-//! granular micro pitch shifter.
+//! One thickened voice: an immutable detune / delay / pan assignment plus
+//! its own granular read head.
+//!
+//! The signal path is deliberately split across two stages that a `Voice`
+//! only *coordinates*:
+//!
+//! ```text
+//!   DelayStage (10 / 24 ms) --> GrainHistory[group] --> Voice::head
+//!                                                        |
+//!                                                   pan + level
+//! ```
+//!
+//! A voice owns no audio buffer of its own. The two grain histories are
+//! shared by the four voices in each delay group, so the eight independent
+//! pitch sweeps cost eight small state structs instead of eight buffers.
 
-use super::delay::DelayLine;
-use super::pitch_shifter::GranularPitchShifter;
+use super::pitch_shifter::{MicroPitchShifter, PitchConfig};
 
 /// Immutable part of a voice (the "wiring", not the DSP memory).
 #[derive(Clone, Copy)]
@@ -13,6 +25,13 @@ pub struct VoiceSpec {
     pub delay_ms: f32,
     /// `true` = hard left voice, `false` = hard right voice.
     pub hard_left: bool,
+}
+
+/// Which of the two delayed mono streams feeds this voice.
+/// 0 = the short (10 ms) group, 1 = the long (24 ms) group.
+#[inline]
+pub fn delay_group(spec: VoiceSpec) -> usize {
+    if spec.delay_ms < 15.0 { 0 } else { 1 }
 }
 
 /// The classic 8-voice ADT cluster.
@@ -64,20 +83,24 @@ pub const VOICE_SPECS: [VoiceSpec; 8] = [
 ];
 
 pub struct Voice {
-    spec: VoiceSpec,
-    shifter: GranularPitchShifter,
+    pub spec: VoiceSpec,
+    /// Stage 2: this voice's independent granular read head.
+    pub head: MicroPitchShifter,
+    /// Index into `Thickener::hist`.
+    pub group: usize,
 }
 
 impl Voice {
-    pub fn new(spec: VoiceSpec, index: usize) -> Self {
+    pub fn new(spec: VoiceSpec, index: usize, cfg: &PitchConfig) -> Self {
         Self {
             spec,
-            shifter: GranularPitchShifter::new((index as f32 + 0.5) / 8.0),
+            head: MicroPitchShifter::new(index, spec.cents > 0.0, cfg),
+            group: delay_group(spec),
         }
     }
 
-    pub fn reset(&mut self, index: usize) {
-        self.shifter.reset((index as f32 + 0.5) / 8.0);
+    pub fn reset(&mut self, index: usize, cfg: &PitchConfig) {
+        self.head.reset(index, self.spec.cents > 0.0, cfg);
     }
 
     #[inline]
@@ -85,18 +108,10 @@ impl Voice {
         self.spec.hard_left
     }
 
-    /// Render this voice's pitch-shifted, delayed mono sample.
+    /// Signed detune in cents after the Detune Depth control.
     #[inline]
-    pub fn render(
-        &mut self,
-        line: &DelayLine,
-        detune_depth: f32,
-        delay_spread: f32,
-        sr: f32,
-    ) -> f32 {
-        let cents = self.spec.cents * detune_depth;
-        let base_delay = self.spec.delay_ms * 0.001 * delay_spread;
-        self.shifter.process(line, cents, base_delay, sr)
+    pub fn cents(&self, detune_depth: f32) -> f32 {
+        self.spec.cents * detune_depth
     }
 }
 
@@ -131,5 +146,26 @@ mod tests {
             assert!(v.delay_ms * 1.3 <= 32.0);
             assert!(v.delay_ms * 0.7 >= 7.0);
         }
+    }
+
+    #[test]
+    fn delay_groups_are_balanced() {
+        let cfg = PitchConfig::new(48_000.0);
+        let voices: Vec<Voice> = VOICE_SPECS
+            .iter()
+            .enumerate()
+            .map(|(i, &spec)| Voice::new(spec, i, &cfg))
+            .collect();
+        assert_eq!(voices.iter().filter(|v| v.group == 0).count(), 4);
+        assert_eq!(voices.iter().filter(|v| v.group == 1).count(), 4);
+
+        // Heads are spread across the window so wraps do not coincide.
+        let offsets: Vec<f32> = voices.iter().map(|v| v.head.offset()).collect();
+        let unique = {
+            let mut o = offsets.clone();
+            o.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            o.windows(2).all(|w| (w[1] - w[0]).abs() > 1.0)
+        };
+        assert!(unique, "heads should be decorrelated: {offsets:?}");
     }
 }
