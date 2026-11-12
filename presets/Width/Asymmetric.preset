@@ -1,0 +1,19 @@
+uuid = "9a6a8312-121d-4f0a-bce3-77bb8e1528a5"
+name = "Asymmetric"
+author = "ThickVox Audio"
+comment = "Odd pairs wide, even pairs narrow: a wider shell with a dense core."
+tags = ["creative", "wide"]
+
+[params]
+0 = 0.35
+1 = 1.0
+2 = 1.0
+4 = 1.0
+5 = -8.0
+6 = 120.0
+7 = 1.5
+8 = false
+10 = 1.0
+11 = 0.55
+12 = 1.0
+13 = 0.3
