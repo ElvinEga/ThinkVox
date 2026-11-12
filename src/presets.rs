@@ -271,6 +271,14 @@ pub(crate) fn serialize(
         "13 = {:.2}  # Pair 4 Spread\n",
         params.pair4_spread.raw_target()
     ));
+    out.push_str(&format!(
+        "14 = {:.1}  # Input Gain\n",
+        params.input_gain.raw_target()
+    ));
+    out.push_str(&format!(
+        "15 = {:.1}  # Output Gain\n",
+        params.output_gain.raw_target()
+    ));
     out
 }
 
@@ -316,6 +324,8 @@ pub(crate) fn apply(preset: &Preset, ctx: &PluginContext<ThickVoxParams>) {
             11 => automate(ctx, &ctx.pair2_spread, plain),
             12 => automate(ctx, &ctx.pair3_spread, plain),
             13 => automate(ctx, &ctx.pair4_spread, plain),
+            14 => automate(ctx, &ctx.input_gain, plain),
+            15 => automate(ctx, &ctx.output_gain, plain),
             _ => {}
         }
     }
@@ -347,6 +357,8 @@ pub(crate) fn matches(preset: &Preset, params: &ThickVoxParams) -> bool {
         11 => close(params.pair2_spread.raw_target(), plain),
         12 => close(params.pair3_spread.raw_target(), plain),
         13 => close(params.pair4_spread.raw_target(), plain),
+        14 => close(params.input_gain.raw_target(), plain),
+        15 => close(params.output_gain.raw_target(), plain),
         _ => true,
     })
 }
@@ -607,7 +619,7 @@ mod tests {
         assert_eq!(parsed.category, "Lead");
         assert_eq!(parsed.author.as_deref(), Some("Producer X"));
         assert!(parsed.is_user);
-        assert_eq!(parsed.params.len(), 12);
+        assert_eq!(parsed.params.len(), 14);
         assert!(matches(&parsed, &params));
     }
 }

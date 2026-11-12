@@ -179,6 +179,30 @@ pub struct ThickVoxParams {
     )]
     pub pair4_spread: FloatParam,
 
+    /// Input gain trim before thickener processing.
+    #[param(
+        id = 14,
+        name = "Input Gain",
+        range = "linear(-24, 12)",
+        default = 0.0,
+        unit = "dB",
+        smooth = "exp(10)",
+        group = "Levels"
+    )]
+    pub input_gain: FloatParam,
+
+    /// Master output volume trim.
+    #[param(
+        id = 15,
+        name = "Output Gain",
+        range = "linear(-24, 12)",
+        default = 0.0,
+        unit = "dB",
+        smooth = "exp(10)",
+        group = "Levels"
+    )]
+    pub output_gain: FloatParam,
+
     // ---- Meter lanes -------------------------------------------------
     // Not parameters: one-way 0..1 peak values the audio thread publishes
     // for the editor's stereo meter. The derive numbers them from
@@ -269,6 +293,10 @@ impl PluginLogic for ThickVox {
         let mut voice_gain = 0.0_f32;
         let mut last_air_db = f32::NAN;
         let mut air_gain = 0.0_f32;
+        let mut last_in_db = f32::NAN;
+        let mut in_gain = 1.0_f32;
+        let mut last_out_db = f32::NAN;
+        let mut out_gain = 1.0_f32;
 
         // Post-mix peaks for the editor. Accumulated here (instead of a
         // second buffer pass) because the frames are already in registers.
@@ -283,6 +311,16 @@ impl PluginLogic for ThickVox {
                 fout[0] = fin[0];
                 fout[1] = fin[1];
             } else {
+                let idb = params.input_gain.read();
+                if idb != last_in_db {
+                    last_in_db = idb;
+                    in_gain = db_to_linear(idb);
+                }
+                let odb = params.output_gain.read();
+                if odb != last_out_db {
+                    last_out_db = odb;
+                    out_gain = db_to_linear(odb);
+                }
                 let vdb = params.voice_level.read();
                 if vdb != last_voice_db {
                     last_voice_db = vdb;
@@ -311,9 +349,11 @@ impl PluginLogic for ThickVox {
                     mid_only: params.mid_only.value(),
                 };
 
-                let (wet_l, wet_r) = state.thickener.process_sample(fin[0], fin[1], &s);
-                fout[0] = fin[0] + wet_l;
-                fout[1] = fin[1] + wet_r;
+                let in_l = fin[0] * in_gain;
+                let in_r = fin[1] * in_gain;
+                let (wet_l, wet_r) = state.thickener.process_sample(in_l, in_r, &s);
+                fout[0] = (in_l + wet_l) * out_gain;
+                fout[1] = (in_r + wet_r) * out_gain;
             }
 
             if state.scope_decimator == 0 {
@@ -361,10 +401,10 @@ impl PluginLogic for ThickVox {
 
     fn editor(params: Arc<ThickVoxParams>) -> Box<dyn Editor> {
         Box::new(
-            EguiEditor::with_ui(params, (900, 600), ThickVoxEditor::new())
+            EguiEditor::with_ui(params, (860, 520), ThickVoxEditor::new())
                 .resizable(true)
-                .min_size((760, 480))
-                .max_size((1800, 1200)),
+                .min_size((740, 460))
+                .max_size((1400, 850)),
         )
     }
 }
@@ -397,6 +437,8 @@ struct ParamSnapshot {
     pair2_spread: f64,
     pair3_spread: f64,
     pair4_spread: f64,
+    input_gain: f64,
+    output_gain: f64,
 }
 
 impl ParamSnapshot {
@@ -414,6 +456,8 @@ impl ParamSnapshot {
             pair2_spread: ctx.pair2_spread.raw_target(),
             pair3_spread: ctx.pair3_spread.raw_target(),
             pair4_spread: ctx.pair4_spread.raw_target(),
+            input_gain: ctx.input_gain.raw_target(),
+            output_gain: ctx.output_gain.raw_target(),
         }
     }
 
@@ -453,6 +497,14 @@ impl ParamSnapshot {
         ctx.automate(
             ctx.pair4_spread.id(),
             ctx.pair4_spread.info.range.normalize(self.pair4_spread),
+        );
+        ctx.automate(
+            ctx.input_gain.id(),
+            ctx.input_gain.info.range.normalize(self.input_gain),
+        );
+        ctx.automate(
+            ctx.output_gain.id(),
+            ctx.output_gain.info.range.normalize(self.output_gain),
         );
     }
 }
@@ -532,7 +584,7 @@ impl EditorUi<ThickVoxParams> for ThickVoxEditor {
         ui.painter().rect_filled(window_rect, 0.0, VST_BG);
 
         // Frame padding
-        let outer = window_rect.shrink(14.0);
+        let outer = window_rect.shrink(10.0);
         ui.scope_builder(egui::UiBuilder::new().max_rect(outer), |ui| {
             self.body(ui, ctx, &palette, &theme);
         });
@@ -735,27 +787,30 @@ impl ThickVoxEditor {
     ) {
         // 1. TOP TOOLBAR
         self.top_toolbar(ui, ctx, palette);
-        ui.add_space(4.0);
+        ui.add_space(2.0);
 
         // 2. SUBTITLE ROW
         self.subtitle_row(ui);
-        ui.add_space(10.0);
+        ui.add_space(6.0);
 
         // 3. MAIN WORKSPACE (Upper Grid + Bottom Tray)
         let avail_w = ui.available_width();
         let avail_h = ui.available_height();
 
-        let bottom_tray_h = 136.0_f32;
-        let gap = 6.0_f32;
-        let upper_grid_h = (avail_h - bottom_tray_h - gap).max(380.0);
+        let gap = 8.0_f32;
+        // Bottom tray takes 23% of available height, clamped to 88..108px
+        let bottom_tray_h = (avail_h * 0.23).clamp(88.0, 108.0);
+        let upper_grid_h = avail_h - bottom_tray_h - gap;
 
-        // Main upper grid: [ Left Column (Thicken / Pair Spread) ] [ Center Column (Image / Tone) ] [ Right Column (Output) ]
-        let output_card_w = 160.0_f32;
-        let left_center_w = (avail_w - output_card_w - gap * 2.0).max(640.0);
-        let col1_w = (left_center_w * 0.58).round();
-        let col2_w = left_center_w - col1_w;
+        // Output card takes ~20% of width, clamped to 155..180px
+        let output_card_w = (avail_w * 0.21).clamp(155.0, 180.0);
+        let left_center_w = avail_w - output_card_w - gap;
+        let col1_w = (left_center_w * 0.57).round();
+        let col2_w = left_center_w - col1_w - gap;
 
-        let row_h = ((upper_grid_h - gap) * 0.5).round();
+        let row_h = ((upper_grid_h - gap) * 0.5).floor();
+        let primary_knob_d = (row_h * 0.32).clamp(46.0, 52.0);
+        let spread_knob_d = (row_h * 0.27).clamp(38.0, 44.0);
 
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = gap;
@@ -769,13 +824,20 @@ impl ThickVoxEditor {
                     ui.horizontal_centered(|ui| {
                         let slot_w = ui.available_width() / 3.0;
                         ui.spacing_mut().item_spacing.x = 0.0;
-                        let knob_d = 80.0;
 
                         ui.allocate_ui_with_layout(
                             egui::vec2(slot_w, ui.available_height()),
                             egui::Layout::top_down(egui::Align::Center),
                             |ui| {
-                                percent_knob(ui, ctx, &ctx.mix, "Mix", (0.0, 100.0), 100.0, knob_d);
+                                percent_knob(
+                                    ui,
+                                    ctx,
+                                    &ctx.mix,
+                                    "Mix",
+                                    (0.0, 100.0),
+                                    100.0,
+                                    primary_knob_d,
+                                );
                             },
                         );
                         ui.allocate_ui_with_layout(
@@ -790,7 +852,7 @@ impl ThickVoxEditor {
                                     (0.5, 2.0),
                                     2,
                                     "×",
-                                    knob_d,
+                                    primary_knob_d,
                                 );
                             },
                         );
@@ -806,7 +868,7 @@ impl ThickVoxEditor {
                                     (0.7, 1.3),
                                     2,
                                     "×",
-                                    knob_d,
+                                    primary_knob_d,
                                 );
                             },
                         );
@@ -823,7 +885,6 @@ impl ThickVoxEditor {
                         ui.horizontal_centered(|ui| {
                             let slot_w = ui.available_width() / 4.0;
                             ui.spacing_mut().item_spacing.x = 0.0;
-                            let knob_d = 80.0;
 
                             ui.allocate_ui_with_layout(
                                 egui::vec2(slot_w, ui.available_height()),
@@ -836,7 +897,7 @@ impl ThickVoxEditor {
                                         "+/ 3c",
                                         (0.0, 100.0),
                                         100.0,
-                                        knob_d,
+                                        spread_knob_d,
                                     );
                                 },
                             );
@@ -851,7 +912,7 @@ impl ThickVoxEditor {
                                         "+/ 6c",
                                         (0.0, 100.0),
                                         100.0,
-                                        knob_d,
+                                        spread_knob_d,
                                     );
                                 },
                             );
@@ -866,7 +927,7 @@ impl ThickVoxEditor {
                                         "+/ 9c",
                                         (0.0, 100.0),
                                         100.0,
-                                        knob_d,
+                                        spread_knob_d,
                                     );
                                 },
                             );
@@ -881,7 +942,7 @@ impl ThickVoxEditor {
                                         "+/ 12c",
                                         (0.0, 100.0),
                                         100.0,
-                                        knob_d,
+                                        spread_knob_d,
                                     );
                                 },
                             );
@@ -897,10 +958,8 @@ impl ThickVoxEditor {
                 // CARD 2: IMAGE
                 render_card(ui, "IMAGE", egui::vec2(col2_w, row_h), palette, |ui| {
                     ui.horizontal_centered(|ui| {
-                        let knob_d = 80.0;
-
                         ui.allocate_ui_with_layout(
-                            egui::vec2(ui.available_width() * 0.5, ui.available_height()),
+                            egui::vec2(ui.available_width() * 0.52, ui.available_height()),
                             egui::Layout::top_down(egui::Align::Center),
                             |ui| {
                                 percent_knob(
@@ -910,7 +969,7 @@ impl ThickVoxEditor {
                                     "Width",
                                     (0.0, 200.0),
                                     100.0,
-                                    knob_d,
+                                    primary_knob_d,
                                 );
                             },
                         );
@@ -932,7 +991,6 @@ impl ThickVoxEditor {
                 render_card(ui, "TONE", egui::vec2(col2_w, row_h), palette, |ui| {
                     ui.horizontal_centered(|ui| {
                         let slot_w = ui.available_width() * 0.5;
-                        let knob_d = 80.0;
 
                         ui.allocate_ui_with_layout(
                             egui::vec2(slot_w, ui.available_height()),
@@ -946,7 +1004,7 @@ impl ThickVoxEditor {
                                     (20.0, 300.0),
                                     0,
                                     "Hz",
-                                    knob_d,
+                                    primary_knob_d,
                                 );
                             },
                         );
@@ -954,7 +1012,7 @@ impl ThickVoxEditor {
                             egui::vec2(slot_w, ui.available_height()),
                             egui::Layout::top_down(egui::Align::Center),
                             |ui| {
-                                db_knob(ui, ctx, &ctx.air, "Air", (0.0, 6.0), knob_d);
+                                db_knob(ui, ctx, &ctx.air, "Air", (0.0, 6.0), primary_knob_d);
                             },
                         );
                     });
@@ -969,6 +1027,44 @@ impl ThickVoxEditor {
                 palette,
                 |ui| {
                     ui.vertical_centered(|ui| {
+                        // In & Out gain knobs side by side
+                        ui.horizontal(|ui| {
+                            let half_w = ui.available_width() * 0.5;
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            let io_knob_d = 36.0;
+
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(half_w, 64.0),
+                                egui::Layout::top_down(egui::Align::Center),
+                                |ui| {
+                                    db_knob(
+                                        ui,
+                                        ctx,
+                                        &ctx.input_gain,
+                                        "In",
+                                        (-24.0, 12.0),
+                                        io_knob_d,
+                                    );
+                                },
+                            );
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(half_w, 64.0),
+                                egui::Layout::top_down(egui::Align::Center),
+                                |ui| {
+                                    db_knob(
+                                        ui,
+                                        ctx,
+                                        &ctx.output_gain,
+                                        "Out",
+                                        (-24.0, 12.0),
+                                        io_knob_d,
+                                    );
+                                },
+                            );
+                        });
+
+                        ui.add_space(4.0);
+
                         let levels = [
                             ChannelLevel::from_linear(ctx.get_meter(ctx.meter_l.id())),
                             ChannelLevel::from_linear(ctx.get_meter(ctx.meter_r.id())),
@@ -980,7 +1076,7 @@ impl ThickVoxEditor {
                             .id(egui::Id::new("thickvox-output-meter"));
                         let meter_width = meter.desired_size(theme).x;
 
-                        let meter_height = (ui.available_height() - 42.0).max(120.0);
+                        let meter_height = (ui.available_height() - 32.0).max(50.0);
                         let (strip, _) = ui.allocate_exact_size(
                             egui::vec2(ui.available_width(), meter_height),
                             Sense::hover(),
@@ -991,7 +1087,7 @@ impl ThickVoxEditor {
                         );
                         meter.paint(ui, theme, meter_rect);
 
-                        ui.add_space(8.0);
+                        ui.add_space(4.0);
                         correlation_strip(
                             ui,
                             ctx.get_meter(ctx.meter_corr.id()),
@@ -1355,36 +1451,36 @@ impl ThickVoxEditor {
 
         child.horizontal_centered(|ui| {
             let total_w = ui.available_width();
-            let left_w = (total_w * 0.28).max(180.0);
-            let center_w = (total_w * 0.40).max(220.0);
-            let right_w = total_w - left_w - center_w;
+            let left_w = (total_w * 0.24).clamp(130.0, 175.0);
+            let right_w = (total_w * 0.42).clamp(180.0, 260.0);
+            let center_w = (total_w - left_w - right_w).max(80.0);
 
             // 1. LEFT: Stereo Imager title & glyph
             ui.allocate_ui_with_layout(
                 egui::vec2(left_w, ui.available_height()),
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
-                    ui.add_space(8.0);
+                    ui.add_space(6.0);
                     // 4-bar waveform icon
                     let (icon_rect, _) =
-                        ui.allocate_exact_size(egui::vec2(22.0, 24.0), Sense::hover());
+                        ui.allocate_exact_size(egui::vec2(20.0, 22.0), Sense::hover());
                     let ip = ui.painter();
-                    let bar_heights = [7.0, 15.0, 21.0, 11.0];
+                    let bar_heights = [6.0, 13.0, 19.0, 10.0];
                     for (i, &h) in bar_heights.iter().enumerate() {
-                        let x = icon_rect.left() + 2.0 + i as f32 * 5.0;
+                        let x = icon_rect.left() + 2.0 + i as f32 * 4.5;
                         let mid_y = icon_rect.center().y;
                         ip.line_segment(
                             [
                                 egui::pos2(x, mid_y - h * 0.5),
                                 egui::pos2(x, mid_y + h * 0.5),
                             ],
-                            Stroke::new(2.2_f32, VST_EMERALD),
+                            Stroke::new(2.0_f32, VST_EMERALD),
                         );
                     }
-                    ui.add_space(8.0);
+                    ui.add_space(6.0);
                     ui.label(
                         RichText::new("STEREO IMAGER")
-                            .font(FontId::proportional(12.0))
+                            .font(FontId::proportional(11.0))
                             .strong()
                             .color(VST_TEXT_MAIN),
                     );
@@ -1396,7 +1492,7 @@ impl ThickVoxEditor {
                 egui::vec2(center_w, ui.available_height()),
                 egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
                 |ui| {
-                    let scope_size = (ui.available_height() - 8.0).min(136.0);
+                    let scope_size = (ui.available_height() - 6.0).clamp(70.0, 94.0);
                     ui.add(
                         Goniometer::new(&self.scope_samples)
                             .size(scope_size)
@@ -1412,13 +1508,13 @@ impl ThickVoxEditor {
                 egui::vec2(right_w, ui.available_height()),
                 egui::Layout::right_to_left(egui::Align::Center),
                 |ui| {
-                    ui.add_space(14.0);
-                    let slider_w = (right_w - 120.0).clamp(120.0, 200.0);
+                    ui.add_space(10.0);
+                    let slider_w = (right_w - 100.0).clamp(80.0, 160.0);
                     voice_level_slider(ui, ctx, slider_w);
-                    ui.add_space(8.0);
+                    ui.add_space(6.0);
                     ui.label(
                         RichText::new("VOICE LEVEL")
-                            .font(FontId::proportional(11.0))
+                            .font(FontId::proportional(10.5))
                             .strong()
                             .color(VST_TEXT_MUTED),
                     );

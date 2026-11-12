@@ -372,6 +372,62 @@ fn voice_level_reaches_the_dsp() {
     );
 }
 
+#[test]
+fn input_gain_reaches_the_dsp() {
+    let quiet = driver!(Plugin)
+        .sample_rate(48_000.0)
+        .channels(2)
+        .duration(Duration::from_millis(200))
+        .input(tone())
+        .set_param(P::InputGain, 0.0) // -24 dB
+        .run();
+
+    let loud = driver!(Plugin)
+        .sample_rate(48_000.0)
+        .channels(2)
+        .duration(Duration::from_millis(200))
+        .input(tone())
+        .set_param(P::InputGain, 1.0) // +12 dB
+        .run();
+
+    let max_diff = quiet.output[0]
+        .iter()
+        .zip(&loud.output[0])
+        .fold(0.0_f32, |m, (a, b)| m.max((a - b).abs()));
+    assert!(
+        max_diff > 1e-2,
+        "Input Gain parameter must reach the DSP: {max_diff}"
+    );
+}
+
+#[test]
+fn output_gain_reaches_the_dsp() {
+    let quiet = driver!(Plugin)
+        .sample_rate(48_000.0)
+        .channels(2)
+        .duration(Duration::from_millis(200))
+        .input(tone())
+        .set_param(P::OutputGain, 0.0) // -24 dB
+        .run();
+
+    let loud = driver!(Plugin)
+        .sample_rate(48_000.0)
+        .channels(2)
+        .duration(Duration::from_millis(200))
+        .input(tone())
+        .set_param(P::OutputGain, 1.0) // +12 dB
+        .run();
+
+    let max_diff = quiet.output[0]
+        .iter()
+        .zip(&loud.output[0])
+        .fold(0.0_f32, |m, (a, b)| m.max((a - b).abs()));
+    assert!(
+        max_diff > 1e-2,
+        "Output Gain parameter must reach the DSP: {max_diff}"
+    );
+}
+
 #[cfg(feature = "rt-paranoid")]
 #[test]
 fn process_never_allocates() {
