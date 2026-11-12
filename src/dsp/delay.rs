@@ -1,8 +1,8 @@
-//! Fixed-capacity fractional delay line.
+//! Fixed-capacity fractional delay line + the ADT delay stage.
 //!
-//! All eight voices read the *same* input signal, so they share one buffer
-//! instead of each owning a copy. That keeps the memory footprint at ~64 kB
-//! per plugin instance at 192 kHz rather than ~512 kB.
+//! The ring buffer is shared wherever eight voices need the same history,
+//! which keeps the memory footprint small. Wrapping is a single bitmask
+//! because capacity is always a power of two.
 
 /// Circular buffer with 4-point cubic (Catmull-Rom) fractional reads.
 ///
@@ -72,6 +72,54 @@ impl DelayLine {
         let c3 = 0.5 * (p3 - p0) + 1.5 * (p1 - p2);
         c0 + f * (c1 + f * (c2 + f * c3))
     }
+
+    /// Nearest-neighbour read, used only by the pitch stage's occasional
+    /// correlation search. A similarity measure does not need fractional
+    /// accuracy, and skipping interpolation makes that bounded loop cheap.
+    #[inline]
+    pub fn sample_nearest(&self, d: f32) -> f32 {
+        let k = (d.max(0.0) as usize).saturating_add(1);
+        self.buf[self.write.wrapping_sub(k) & self.mask]
+    }
+}
+
+/// Stage 1 of the wet chain: the ADT / doubling delay.
+///
+/// This stage knows nothing about pitch shifting. It owns the shared input
+/// history and hands back exactly two delayed mono streams (10 ms and 24 ms
+/// at Delay Spread = 100%), which are then fed to the pitch stage. Keeping
+/// the two concerns separate means the grain size can be changed without
+/// touching the classic doubling times, and vice versa.
+pub struct DelayStage {
+    line: DelayLine,
+}
+
+impl DelayStage {
+    pub fn new(min_capacity_samples: usize) -> Self {
+        Self {
+            line: DelayLine::new(min_capacity_samples),
+        }
+    }
+
+    /// Feed the mono sum of the input, once per sample.
+    #[inline]
+    pub fn push(&mut self, mono: f32) {
+        self.line.push(mono);
+    }
+
+    /// The input as it was `ms` milliseconds ago, cubic-interpolated.
+    #[inline]
+    pub fn read_ms(&self, ms: f32, sr: f32) -> f32 {
+        self.line.read(ms.max(0.0) * 0.001 * sr)
+    }
+
+    pub fn clear(&mut self) {
+        self.line.clear();
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.line.capacity()
+    }
 }
 
 #[cfg(test)]
@@ -88,6 +136,17 @@ mod tests {
         assert!((line.read(1.0) - 98.0).abs() < 1e-5, "d=1 -> x[n-1]");
         assert!((line.read(2.0) - 97.0).abs() < 1e-5, "d=2 -> x[n-2]");
         assert!((line.read(10.0) - 89.0).abs() < 1e-5, "d=10 -> x[n-10]");
+    }
+
+    #[test]
+    fn nearest_matches_cubic_at_integer_delays() {
+        let mut line = DelayLine::new(64);
+        for n in 0..100 {
+            line.push(n as f32 * 0.5);
+        }
+        for d in [1.0_f32, 2.0, 10.0, 30.0] {
+            assert!((line.read(d) - line.sample_nearest(d)).abs() < 1e-5);
+        }
     }
 
     #[test]
@@ -120,5 +179,19 @@ mod tests {
         line.push(1.0);
         assert!(line.read(0.0).is_finite());
         assert!(line.read(10_000.0).is_finite());
+    }
+
+    #[test]
+    fn delay_stage_is_a_plain_delay() {
+        let sr = 48_000.0;
+        let mut stage = DelayStage::new(8192);
+        // 10 ms = 480 samples.
+        for n in 0..2000 {
+            stage.push((2.0 * core::f32::consts::PI * 220.0 * n as f32 / sr).sin());
+        }
+        let n = 1999.0_f32;
+        let got = stage.read_ms(10.0, sr);
+        let want = (2.0 * core::f32::consts::PI * 220.0 * (n - 480.0) / sr).sin();
+        assert!((got - want).abs() < 1e-3, "{got} vs {want}");
     }
 }
