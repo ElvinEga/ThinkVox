@@ -1,0 +1,20 @@
+uuid = "42756ba0-5fb2-4f45-9e74-ec0cbd6afc85"
+name = "Classic Wide"
+author = "ThickVox Audio"
+comment = "The original Huart-style cluster: every pair hard-panned, full M/S width."
+tags = ["wide", "default"]
+default = true
+
+[params]
+0 = 0.35   # Mix
+1 = 1.0    # Detune Depth
+2 = 1.0    # Delay Spread
+4 = 1.0    # Stereo Width
+5 = -8.0   # Voice Level
+6 = 120.0  # Side HPF
+7 = 1.5    # Air
+8 = false  # Mid Only
+10 = 1.0   # Pair 1 Spread
+11 = 1.0   # Pair 2 Spread
+12 = 1.0   # Pair 3 Spread
+13 = 1.0   # Pair 4 Spread
