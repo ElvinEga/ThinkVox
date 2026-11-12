@@ -221,6 +221,32 @@ fn process_publishes_stereo_meters() {
     assertions::assert_meter_above(&result, params.meter_r.id(), 0.01);
 }
 
+/// The output correlation meter must be published and settle in a valid range.
+#[test]
+fn process_publishes_correlation_meter() {
+    use thickvox::ThickVoxParams;
+    use truce_test::MeterCapture;
+
+    let params = ThickVoxParams::default();
+    let result = driver!(Plugin)
+        .sample_rate(48_000.0)
+        .channels(2)
+        .duration(Duration::from_millis(200))
+        .input(tone())
+        .capture_meters(MeterCapture::Final)
+        .run();
+
+    // With a mono center tone plus subtle stereo wet doubling, correlation
+    // should remain strongly positive (> 0.5) and mono-compatible.
+    assertions::assert_meter_above(&result, params.meter_corr.id(), 0.5);
+}
+
+#[test]
+fn editor_builds_and_runs_lifecycle() {
+    truce_test::assert_has_editor::<Plugin>();
+    truce_test::assert_editor_lifecycle::<Plugin>();
+}
+
 /// Bypass must still feed the meters, because the editor shows the bus
 /// that is actually leaving the plugin.
 #[test]

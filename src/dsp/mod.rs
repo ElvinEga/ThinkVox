@@ -38,5 +38,6 @@
 pub mod delay;
 pub mod filter;
 pub mod pitch_shifter;
+pub mod stereo_imager;
 pub mod thickener;
 pub mod voice;

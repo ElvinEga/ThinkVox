@@ -12,7 +12,7 @@
 
 use std::sync::OnceLock;
 
-use truce::PluginContext;
+use truce::core::PluginContext;
 use truce::params::FloatParam;
 
 use crate::ThickVoxParams;
@@ -21,6 +21,7 @@ use crate::ThickVoxParams;
 pub(crate) struct FactoryPreset {
     pub(crate) name: String,
     pub(crate) category: &'static str,
+    #[allow(dead_code)]
     pub(crate) author: Option<String>,
     /// The library's "init" sound. Exactly one factory preset sets this.
     pub(crate) default: bool,
@@ -40,10 +41,7 @@ const PRESET_FILES: &[(&str, &str)] = &[
         include_str!("../presets/Width/Medium Width.preset"),
     ),
     ("Width", include_str!("../presets/Width/Clustered.preset")),
-    (
-        "Width",
-        include_str!("../presets/Width/Asymmetric.preset"),
-    ),
+    ("Width", include_str!("../presets/Width/Asymmetric.preset")),
     (
         "Thickness",
         include_str!("../presets/Thickness/Centred Thickness.preset"),

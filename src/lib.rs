@@ -14,19 +14,17 @@
 //!
 //! See [`dsp`] for the signal flow and algorithm notes.
 
-use egui::{Color32, Rect, RichText, Sense};
+use egui::{Color32, CornerRadius, FontId, Rect, RichText, Sense, Stroke, StrokeKind, Vec2};
 use noda_audio::oklab::with_alpha;
-use noda_audio::taper::Taper;
 use noda_audio::ui::theme::{Palette, Theme};
-use noda_audio::ui::{
-    ChannelLevel, Fader, Knob, LevelMeter, Preset, PresetBrowser, RackFrame, Reading, SectionHeader,
-};
+use noda_audio::ui::{ChannelLevel, Goniometer, Knob, LevelMeter, Reading};
 use truce::prelude::*;
 use truce_egui::{EditorUi, EguiEditor};
 
 pub mod dsp;
 mod presets;
 
+use dsp::stereo_imager::{StereoSample, StereoScopeBuffer};
 use dsp::thickener::{Settings, Thickener};
 
 /// Host-visible, automatable parameters.
@@ -196,6 +194,10 @@ pub struct ThickVoxParams {
     /// means the wet cluster folds toward cancellation in mono.
     #[meter]
     pub meter_corr: MeterSlot,
+
+    /// Lock-free ring buffer streaming stereo output samples to the goniometer.
+    #[skip]
+    pub scope: Arc<StereoScopeBuffer>,
 }
 
 /// The plugin descriptor is also its own per-instance DSP state, so the
@@ -204,6 +206,8 @@ pub struct ThickVox {
     thickener: Thickener,
     /// Smoothed output correlation in -1..+1, updated once per block.
     correlation: f32,
+    /// Downsample counter for feeding the scope buffer every 6 samples.
+    scope_decimator: usize,
 }
 
 impl Default for ThickVox {
@@ -213,6 +217,7 @@ impl Default for ThickVox {
             // Silence is "perfectly mono" rather than "no reading": a fresh
             // instance should not light the phase warning before audio runs.
             correlation: 1.0,
+            scope_decimator: 0,
         }
     }
 }
@@ -235,9 +240,11 @@ impl PluginLogic for ThickVox {
 
     /// Off the audio thread: size the delay line for the host sample rate and
     /// clear all DSP memory. Called again if the sample rate changes.
-    fn reset(state: &mut Self::DspState, _params: &Self::Params, config: &AudioConfig) {
+    fn reset(state: &mut Self::DspState, params: &Self::Params, config: &AudioConfig) {
         state.thickener.prepare(config.sample_rate as f32);
         state.correlation = 1.0;
+        state.scope_decimator = 0;
+        params.scope.clear();
     }
 
     fn process(
@@ -309,6 +316,12 @@ impl PluginLogic for ThickVox {
                 fout[1] = fin[1] + wet_r;
             }
 
+            if state.scope_decimator == 0 {
+                params.scope.push(fout[0], fout[1]);
+                state.scope_decimator = 6;
+            }
+            state.scope_decimator -= 1;
+
             peak_l = peak_l.max(fout[0].abs());
             peak_r = peak_r.max(fout[1].abs());
             lr += f64::from(fout[0]) * f64::from(fout[1]);
@@ -328,7 +341,7 @@ impl PluginLogic for ThickVox {
         let denominator = (ll * rr).sqrt();
         if denominator > 1e-12 {
             let correlation = (lr / denominator).clamp(-1.0, 1.0) as f32;
-            let sr = state.thickener.sample_rate() as f32;
+            let sr = state.thickener.sample_rate();
             let alpha = (frames as f32 / (0.15 * sr)).clamp(0.02, 0.5);
             state.correlation += (correlation - state.correlation) * alpha;
         }
@@ -348,10 +361,10 @@ impl PluginLogic for ThickVox {
 
     fn editor(params: Arc<ThickVoxParams>) -> Box<dyn Editor> {
         Box::new(
-            EguiEditor::with_ui(params, (480, 700), ThickVoxEditor::new())
+            EguiEditor::with_ui(params, (1280, 780), ThickVoxEditor::new())
                 .resizable(true)
-                .min_size((464, 684))
-                .max_size((1100, 940)),
+                .min_size((1020, 640))
+                .max_size((2400, 1500)),
         )
     }
 }
@@ -360,94 +373,182 @@ impl PluginLogic for ThickVox {
 // Editor
 // ---------------------------------------------------------------------------
 
-/// Custom egui editor built from NodaAudio controls.
-///
-/// One rack chassis holds the whole editor: the four sections that shape the
-/// cluster on the left, the master strip on the right. The chassis supplies
-/// the power lamp, title badge and screw heads; `SectionHeader` supplies the
-/// group titles and their accent rules, so the type and colour scale come
-/// from the library rather than being redrawn here.
+// Premium dark graphite + emerald color tokens matching the hardware visual
+const VST_BG: Color32 = Color32::from_rgb(11, 14, 18);
+const VST_CARD_BG: Color32 = Color32::from_rgb(17, 21, 28);
+const VST_CARD_BORDER: Color32 = Color32::from_rgb(30, 37, 48);
+const VST_EMERALD: Color32 = Color32::from_rgb(0, 229, 153);
+const VST_TEXT_MAIN: Color32 = Color32::from_rgb(240, 244, 250);
+const VST_TEXT_MUTED: Color32 = Color32::from_rgb(125, 138, 155);
+const VST_TRACK_BG: Color32 = Color32::from_rgb(25, 31, 42);
+
+/// State snapshot for A/B comparison.
+#[derive(Clone, Copy)]
+struct ParamSnapshot {
+    mix: f64,
+    detune_depth: f64,
+    delay_spread: f64,
+    width: f64,
+    voice_level: f64,
+    side_hpf: f64,
+    air: f64,
+    mid_only: bool,
+    pair1_spread: f64,
+    pair2_spread: f64,
+    pair3_spread: f64,
+    pair4_spread: f64,
+}
+
+impl ParamSnapshot {
+    fn capture(ctx: &PluginContext<ThickVoxParams>) -> Self {
+        Self {
+            mix: ctx.mix.raw_target(),
+            detune_depth: ctx.detune_depth.raw_target(),
+            delay_spread: ctx.delay_spread.raw_target(),
+            width: ctx.width.raw_target(),
+            voice_level: ctx.voice_level.raw_target(),
+            side_hpf: ctx.side_hpf.raw_target(),
+            air: ctx.air.raw_target(),
+            mid_only: ctx.mid_only.value(),
+            pair1_spread: ctx.pair1_spread.raw_target(),
+            pair2_spread: ctx.pair2_spread.raw_target(),
+            pair3_spread: ctx.pair3_spread.raw_target(),
+            pair4_spread: ctx.pair4_spread.raw_target(),
+        }
+    }
+
+    fn restore(&self, ctx: &PluginContext<ThickVoxParams>) {
+        ctx.automate(ctx.mix.id(), ctx.mix.info.range.normalize(self.mix));
+        ctx.automate(
+            ctx.detune_depth.id(),
+            ctx.detune_depth.info.range.normalize(self.detune_depth),
+        );
+        ctx.automate(
+            ctx.delay_spread.id(),
+            ctx.delay_spread.info.range.normalize(self.delay_spread),
+        );
+        ctx.automate(ctx.width.id(), ctx.width.info.range.normalize(self.width));
+        ctx.automate(
+            ctx.voice_level.id(),
+            ctx.voice_level.info.range.normalize(self.voice_level),
+        );
+        ctx.automate(
+            ctx.side_hpf.id(),
+            ctx.side_hpf.info.range.normalize(self.side_hpf),
+        );
+        ctx.automate(ctx.air.id(), ctx.air.info.range.normalize(self.air));
+        ctx.automate(ctx.mid_only.id(), f64::from(u8::from(self.mid_only)));
+        ctx.automate(
+            ctx.pair1_spread.id(),
+            ctx.pair1_spread.info.range.normalize(self.pair1_spread),
+        );
+        ctx.automate(
+            ctx.pair2_spread.id(),
+            ctx.pair2_spread.info.range.normalize(self.pair2_spread),
+        );
+        ctx.automate(
+            ctx.pair3_spread.id(),
+            ctx.pair3_spread.info.range.normalize(self.pair3_spread),
+        );
+        ctx.automate(
+            ctx.pair4_spread.id(),
+            ctx.pair4_spread.info.range.normalize(self.pair4_spread),
+        );
+    }
+}
+
+/// Custom egui editor built as a premium landscape VST plugin interface.
 struct ThickVoxEditor {
-    /// The theme writes into the egui context, so it only needs installing
-    /// once per window (not once per frame).
     theme_installed: bool,
-    /// NodaAudio's view of the factory bank, built once from `presets/`.
-    preset_items: Vec<Preset>,
-    /// The preset the picker currently names.
     preset_index: usize,
-    /// The index whose values were last applied (or last matched). A picker
-    /// index that differs from this one means the user chose a preset this
-    /// frame, rather than the host restoring state underneath us.
     applied_preset: usize,
+    scope_samples: Vec<StereoSample>,
+    // A/B comparison slots
+    ab_slot: char,
+    slot_a: Option<ParamSnapshot>,
+    slot_b: Option<ParamSnapshot>,
+    // Settings modal toggle
+    show_settings: bool,
 }
 
 impl ThickVoxEditor {
     fn new() -> Self {
-        let preset_items = presets::factory_presets()
-            .iter()
-            .map(|preset| {
-                let mut item = Preset::new(preset.category, preset.name.as_str());
-                if let Some(author) = &preset.author {
-                    item = item.author(author.as_str());
-                }
-                item
-            })
-            .collect();
         let default = presets::default_index();
         Self {
             theme_installed: false,
-            preset_items,
             preset_index: default,
-            // Start "applied": opening the editor must not overwrite state
-            // the host just restored. The sync pass corrects the label if
-            // those values match a different factory preset.
             applied_preset: default,
+            scope_samples: Vec::with_capacity(crate::dsp::stereo_imager::DEFAULT_SCOPE_CAPACITY),
+            ab_slot: 'A',
+            slot_a: None,
+            slot_b: None,
+            show_settings: false,
         }
     }
-
-    /// Width of the control column. The pair-spread row is the widest thing
-    /// in it: four 70 pt knobs plus the 10 pt gaps between them.
-    const CONTROLS_WIDTH: f32 = 316.0;
-
-    /// Width of the master strip: a stereo meter plus the wet fader, with
-    /// room for the meter's dB scale on its right.
-    const OUTPUT_WIDTH: f32 = 96.0;
-
-    /// Vertical room the chassis takes away from the body: its two 12 pt
-    /// margins, the title badge row above `show` and the gap under it.
-    const CHASSIS_CHROME: f32 = 52.0;
 }
 
 impl EditorUi<ThickVoxParams> for ThickVoxEditor {
     fn ui(&mut self, ui: &mut egui::Ui, ctx: &PluginContext<ThickVoxParams>) {
         if !self.theme_installed {
-            Theme::dark().install(ui.ctx());
+            let mut theme = Theme::dark();
+            theme.palette.background = VST_BG;
+            theme.palette.surface = VST_CARD_BG;
+            theme.palette.border = VST_CARD_BORDER;
+            theme.palette.primary = VST_EMERALD;
+            theme.palette.meter_ok = VST_EMERALD;
+            theme.palette.track = VST_TRACK_BG;
+            theme.palette.foreground = VST_TEXT_MAIN;
+            theme.palette.text_dim = VST_TEXT_MUTED;
+            theme.palette.channel_monitor = VST_EMERALD;
+            theme.install(ui.ctx());
             self.theme_installed = true;
         }
 
-        // Meter ballistics release on wall-clock time, so keep the window
-        // painting between gestures or the bars freeze mid-fall.
+        // Fetch fresh scope samples into the reusable scratch vector
+        ctx.scope.read_samples(&mut self.scope_samples);
+
+        // Continuous refresh for smooth meter ballistics and goniometer animation
         ui.ctx()
-            .request_repaint_after(std::time::Duration::from_millis(33));
+            .request_repaint_after(std::time::Duration::from_millis(30));
 
         let theme = Theme::of(ui);
         let palette = theme.palette.clone();
-        ui.painter()
-            .rect_filled(ui.max_rect(), 0.0, palette.background);
 
-        // The chassis is the editor. Sizing it off the window rather than
-        // off its contents keeps the metal reaching the edges when a host
-        // hands the window more room than the controls need.
-        let outer = ui.max_rect().shrink(8.0);
-        let body_height = (outer.height() - Self::CHASSIS_CHROME).max(0.0);
+        let window_rect = ui.max_rect();
+        ui.painter().rect_filled(window_rect, 0.0, VST_BG);
 
+        // Frame padding
+        let outer = window_rect.shrink(14.0);
         ui.scope_builder(egui::UiBuilder::new().max_rect(outer), |ui| {
-            RackFrame::new("THICKVOX")
-                .subtitle("8-VOICE VOCAL THICKENER")
-                .power_on(!ctx.bypass.value())
-                .height(body_height)
-                .show(ui, |ui| self.body(ui, ctx, &palette, &theme));
+            self.body(ui, ctx, &palette, &theme);
         });
+
+        // Optional settings popover
+        if self.show_settings {
+            egui::Window::new("ThickVox Settings")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ui.ctx(), |ui| {
+                    ui.spacing_mut().item_spacing.y = 8.0;
+                    ui.label(
+                        RichText::new("THICKVOX")
+                            .strong()
+                            .color(VST_EMERALD)
+                            .size(14.0),
+                    );
+                    ui.label("8-Voice Vocal Thickener & ADT Stereo Processor");
+                    ui.separator();
+                    ui.label("• Latency: 0 samples (zero latency dry path)");
+                    ui.label("• Detune: 4 mirrored pairs (±3c, ±6c, ±9c, ±12c)");
+                    ui.label("• Shaping: Mid/Side highpass filter + Air shelf");
+                    ui.label("• Real-time: Lock-free, zero-allocation DSP engine");
+                    ui.add_space(8.0);
+                    if ui.button("Close").clicked() {
+                        self.show_settings = false;
+                    }
+                });
+        }
     }
 }
 
@@ -459,317 +560,922 @@ impl ThickVoxEditor {
         palette: &Palette,
         theme: &Theme,
     ) {
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("4 mirrored pairs · ±3 to ±12 cents · dry path untouched")
-                    .size(9.5)
-                    .color(palette.text_dim),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                power_switch(ui, ctx, palette);
-            });
-        });
-        ui.add_space(theme.size.gap());
+        // 1. TOP TOOLBAR
+        self.top_toolbar(ui, ctx, palette);
+        ui.add_space(4.0);
+
+        // 2. SUBTITLE ROW
+        self.subtitle_row(ui);
+        ui.add_space(10.0);
+
+        // 3. MAIN WORKSPACE (Upper Grid + Bottom Tray)
+        let avail_w = ui.available_width();
+        let avail_h = ui.available_height();
+
+        let bottom_tray_h = 152.0_f32;
+        let gap = 12.0_f32;
+        let upper_grid_h = (avail_h - bottom_tray_h - gap).max(340.0);
+
+        // Main upper grid: [ Left Column (Thicken / Pair Spread) ] [ Center Column (Image / Tone) ] [ Right Column (Output) ]
+        let output_card_w = 176.0_f32;
+        let left_center_w = (avail_w - output_card_w - gap).max(640.0);
+        let col1_w = (left_center_w * 0.58).round();
+        let col2_w = left_center_w - col1_w - gap;
+
+        let row_h = ((upper_grid_h - gap) * 0.5).round();
 
         ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            self.preset_row(ui, ctx, palette);
-        });
-        ui.add_space(theme.size.gap());
+            ui.spacing_mut().item_spacing.x = gap;
 
-        // Two columns with the controls centered as a block, so a wider
-        // window grows symmetric gutters instead of one gap after the meter.
-        let gap = theme.size.gap() * 2.0;
-        let block = Self::CONTROLS_WIDTH + gap + Self::OUTPUT_WIDTH;
-        let gutter = ((ui.available_width() - block) * 0.5).max(0.0);
-
-        ui.horizontal_top(|ui| {
-            ui.add_space(gutter);
-
+            // Column 1: THICKEN (top) and PAIR SPREAD (bottom)
             ui.vertical(|ui| {
-                ui.set_width(Self::CONTROLS_WIDTH);
-                ui.spacing_mut().item_spacing.x = 10.0;
-                let knob_width = {
-                    let mut probe = 0.0;
-                    Knob::new(&mut probe).desired_size(theme).x
-                };
+                ui.spacing_mut().item_spacing.y = gap;
 
-                section(ui, "THICKEN", palette.primary, knob_width, 3, |ui| {
-                    percent_knob(ui, ctx, &ctx.mix, "Mix", (0.0, 100.0), 100.0);
-                    unit_knob(ui, ctx, &ctx.detune_depth, "Detune", (0.5, 2.0), 2, "×");
-                    unit_knob(ui, ctx, &ctx.delay_spread, "Delay", (0.7, 1.3), 2, "×");
-                });
+                // CARD 1: THICKEN
+                render_card(ui, "THICKEN", egui::vec2(col1_w, row_h), palette, |ui| {
+                    ui.horizontal_centered(|ui| {
+                        let slot_w = ui.available_width() / 3.0;
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        let knob_d = 56.0;
 
-                section(ui, "IMAGE", palette.channel_monitor, knob_width, 1, |ui| {
-                    // 0..200%: 100% is the untouched cluster, 200% is
-                    // hyper-wide, 0% folds the wet bus to mono.
-                    percent_knob(ui, ctx, &ctx.width, "Width", (0.0, 200.0), 100.0);
-                    // The toggle is the only other thing in this row, so it
-                    // sits against the far edge instead of floating after
-                    // the dial with a ragged gap.
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let mut mid_only = ctx.mid_only.value();
-                        if ui
-                            .add(egui::Checkbox::new(&mut mid_only, "Mid Only"))
-                            .on_hover_text(
-                                "Fold the wet cluster to mono for a denser, mono-safe thickness",
-                            )
-                            .changed()
-                        {
-                            ctx.automate(ctx.mid_only.id(), f64::from(u8::from(mid_only)));
-                        }
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(slot_w, ui.available_height()),
+                            egui::Layout::top_down(egui::Align::Center),
+                            |ui| {
+                                percent_knob(ui, ctx, &ctx.mix, "Mix", (0.0, 100.0), 100.0, knob_d);
+                            },
+                        );
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(slot_w, ui.available_height()),
+                            egui::Layout::top_down(egui::Align::Center),
+                            |ui| {
+                                unit_knob(
+                                    ui,
+                                    ctx,
+                                    &ctx.detune_depth,
+                                    "Detune",
+                                    (0.5, 2.0),
+                                    2,
+                                    "×",
+                                    knob_d,
+                                );
+                            },
+                        );
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(slot_w, ui.available_height()),
+                            egui::Layout::top_down(egui::Align::Center),
+                            |ui| {
+                                unit_knob(
+                                    ui,
+                                    ctx,
+                                    &ctx.delay_spread,
+                                    "Delay",
+                                    (0.7, 1.3),
+                                    2,
+                                    "×",
+                                    knob_d,
+                                );
+                            },
+                        );
                     });
                 });
 
-                section(ui, "PAIR SPREAD", palette.meter_ok, knob_width, 4, |ui| {
-                    percent_knob(ui, ctx, &ctx.pair1_spread, "+/-3c", (0.0, 100.0), 100.0);
-                    percent_knob(ui, ctx, &ctx.pair2_spread, "+/-6c", (0.0, 100.0), 100.0);
-                    percent_knob(ui, ctx, &ctx.pair3_spread, "+/-9c", (0.0, 100.0), 100.0);
-                    percent_knob(ui, ctx, &ctx.pair4_spread, "+/-12c", (0.0, 100.0), 100.0);
+                // CARD 3: PAIR SPREAD
+                render_card(
+                    ui,
+                    "PAIR SPREAD",
+                    egui::vec2(col1_w, row_h),
+                    palette,
+                    |ui| {
+                        ui.horizontal_centered(|ui| {
+                            let slot_w = ui.available_width() / 4.0;
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            let knob_d = 50.0;
+
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(slot_w, ui.available_height()),
+                                egui::Layout::top_down(egui::Align::Center),
+                                |ui| {
+                                    percent_knob(
+                                        ui,
+                                        ctx,
+                                        &ctx.pair1_spread,
+                                        "+/ 3c",
+                                        (0.0, 100.0),
+                                        100.0,
+                                        knob_d,
+                                    );
+                                },
+                            );
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(slot_w, ui.available_height()),
+                                egui::Layout::top_down(egui::Align::Center),
+                                |ui| {
+                                    percent_knob(
+                                        ui,
+                                        ctx,
+                                        &ctx.pair2_spread,
+                                        "+/ 6c",
+                                        (0.0, 100.0),
+                                        100.0,
+                                        knob_d,
+                                    );
+                                },
+                            );
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(slot_w, ui.available_height()),
+                                egui::Layout::top_down(egui::Align::Center),
+                                |ui| {
+                                    percent_knob(
+                                        ui,
+                                        ctx,
+                                        &ctx.pair3_spread,
+                                        "+/ 9c",
+                                        (0.0, 100.0),
+                                        100.0,
+                                        knob_d,
+                                    );
+                                },
+                            );
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(slot_w, ui.available_height()),
+                                egui::Layout::top_down(egui::Align::Center),
+                                |ui| {
+                                    percent_knob(
+                                        ui,
+                                        ctx,
+                                        &ctx.pair4_spread,
+                                        "+/ 12c",
+                                        (0.0, 100.0),
+                                        100.0,
+                                        knob_d,
+                                    );
+                                },
+                            );
+                        });
+                    },
+                );
+            });
+
+            // Column 2: IMAGE (top) and TONE (bottom)
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = gap;
+
+                // CARD 2: IMAGE
+                render_card(ui, "IMAGE", egui::vec2(col2_w, row_h), palette, |ui| {
+                    ui.horizontal_centered(|ui| {
+                        let slot_w = ui.available_width() * 0.5;
+                        let knob_d = 56.0;
+
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(slot_w, ui.available_height()),
+                            egui::Layout::top_down(egui::Align::Center),
+                            |ui| {
+                                percent_knob(
+                                    ui,
+                                    ctx,
+                                    &ctx.width,
+                                    "Width",
+                                    (0.0, 200.0),
+                                    100.0,
+                                    knob_d,
+                                );
+                            },
+                        );
+
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(slot_w, ui.available_height()),
+                            egui::Layout::top_down(egui::Align::Center),
+                            |ui| {
+                                ui.add_space(ui.available_height() * 0.35);
+                                let mut mid_only = ctx.mid_only.value();
+                                if emerald_checkbox(ui, &mut mid_only, "Mid Only").changed() {
+                                    ctx.automate(ctx.mid_only.id(), f64::from(u8::from(mid_only)));
+                                }
+                            },
+                        );
+                    });
                 });
 
-                section(ui, "TONE", palette.meter_warn, knob_width, 2, |ui| {
-                    unit_knob(ui, ctx, &ctx.side_hpf, "Side HPF", (20.0, 300.0), 0, "Hz");
-                    db_knob(ui, ctx, &ctx.air, "Air", (0.0, 6.0));
+                // CARD 4: TONE
+                render_card(ui, "TONE", egui::vec2(col2_w, row_h), palette, |ui| {
+                    ui.horizontal_centered(|ui| {
+                        let slot_w = ui.available_width() * 0.5;
+                        let knob_d = 56.0;
+
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(slot_w, ui.available_height()),
+                            egui::Layout::top_down(egui::Align::Center),
+                            |ui| {
+                                unit_knob(
+                                    ui,
+                                    ctx,
+                                    &ctx.side_hpf,
+                                    "Side HPF",
+                                    (20.0, 300.0),
+                                    0,
+                                    "Hz",
+                                    knob_d,
+                                );
+                            },
+                        );
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(slot_w, ui.available_height()),
+                            egui::Layout::top_down(egui::Align::Center),
+                            |ui| {
+                                db_knob(ui, ctx, &ctx.air, "Air", (0.0, 6.0), knob_d);
+                            },
+                        );
+                    });
                 });
             });
 
-            ui.add_space(gap);
-            self.master_strip(ui, ctx, palette, theme);
+            // Column 3: OUTPUT (tall card spanning both rows)
+            render_card(
+                ui,
+                "OUTPUT",
+                egui::vec2(output_card_w, upper_grid_h),
+                palette,
+                |ui| {
+                    ui.vertical_centered(|ui| {
+                        let levels = [
+                            ChannelLevel::from_linear(ctx.get_meter(ctx.meter_l.id())),
+                            ChannelLevel::from_linear(ctx.get_meter(ctx.meter_r.id())),
+                        ];
+                        let meter = LevelMeter::stereo(&levels)
+                            .scale(true)
+                            .readout(false)
+                            .clip(true)
+                            .id(egui::Id::new("thickvox-output-meter"));
+                        let meter_width = meter.desired_size(theme).x;
+
+                        let meter_height = (ui.available_height() - 42.0).max(120.0);
+                        let (strip, _) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), meter_height),
+                            Sense::hover(),
+                        );
+                        let meter_rect = Rect::from_center_size(
+                            strip.center(),
+                            egui::vec2(meter_width, meter_height),
+                        );
+                        meter.paint(ui, theme, meter_rect);
+
+                        ui.add_space(8.0);
+                        correlation_strip(
+                            ui,
+                            ctx.get_meter(ctx.meter_corr.id()),
+                            ui.available_width() - 8.0,
+                        );
+                    });
+                },
+            );
         });
+
+        ui.add_space(gap);
+
+        // 4. BOTTOM TRAY: STEREO IMAGER + VOICE LEVEL
+        self.bottom_tray(ui, ctx, egui::vec2(avail_w, bottom_tray_h), palette);
     }
 
-    /// The factory preset picker plus a "modified" marker.
-    ///
-    /// The browser only reports an index; writing the values is our job.
-    /// Applying is gated on `index != applied_preset`, so a restored host
-    /// state survives the first paint, while a real pick writes every
-    /// parameter in one `begin_edit` / `set_param` / `end_edit` gesture.
-    fn preset_row(
+    /// Top toolbar matching the reference image:
+    /// Mac window dots, brand badge, preset navigator, A/B toggle, settings, and power button.
+    fn top_toolbar(
         &mut self,
         ui: &mut egui::Ui,
         ctx: &PluginContext<ThickVoxParams>,
         palette: &Palette,
+    ) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+
+            // Window dots (decorative macOS traffic lights)
+            let (dots_rect, _) = ui.allocate_exact_size(egui::vec2(44.0, 24.0), Sense::hover());
+            let painter = ui.painter();
+            let dot_y = dots_rect.center().y;
+            painter.circle_filled(
+                egui::pos2(dots_rect.left() + 6.0, dot_y),
+                4.5,
+                Color32::from_rgb(255, 95, 86),
+            );
+            painter.circle_filled(
+                egui::pos2(dots_rect.left() + 20.0, dot_y),
+                4.5,
+                Color32::from_rgb(255, 189, 46),
+            );
+            painter.circle_filled(
+                egui::pos2(dots_rect.left() + 34.0, dot_y),
+                4.5,
+                Color32::from_rgb(39, 201, 63),
+            );
+
+            ui.add_space(4.0);
+
+            // Glowing emerald lamp
+            let (lamp_rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 24.0), Sense::hover());
+            let lamp_center = lamp_rect.center();
+            let lamp_p = ui.painter();
+            if !ctx.bypass.value() {
+                lamp_p.circle_filled(lamp_center, 7.5, with_alpha(VST_EMERALD, 0.25));
+                lamp_p.circle_filled(lamp_center, 4.5, VST_EMERALD);
+            } else {
+                lamp_p.circle_filled(lamp_center, 4.5, Color32::from_rgb(60, 70, 80));
+            }
+
+            // Brand title + subtitle
+            ui.label(
+                RichText::new("THICKVOX")
+                    .font(FontId::proportional(14.0))
+                    .strong()
+                    .color(VST_TEXT_MAIN),
+            );
+            ui.label(
+                RichText::new("|")
+                    .font(FontId::proportional(13.0))
+                    .color(Color32::from_rgb(65, 75, 90)),
+            );
+            ui.label(
+                RichText::new("8-VOICE VOCAL THICKENER")
+                    .font(FontId::proportional(11.0))
+                    .color(VST_TEXT_MUTED),
+            );
+
+            // Right-aligned toolbar controls
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+
+                // Power ON / BYP toggle pill
+                power_switch(ui, ctx);
+
+                // Settings gear
+                let gear_btn = egui::Button::new(
+                    RichText::new("⚙")
+                        .font(FontId::proportional(12.0))
+                        .color(VST_TEXT_MUTED),
+                )
+                .fill(Color32::from_rgba_unmultiplied(255, 255, 255, 8))
+                .stroke(Stroke::new(1.0_f32, VST_CARD_BORDER))
+                .corner_radius(CornerRadius::same(5))
+                .min_size(egui::vec2(28.0, 24.0));
+                if ui.add(gear_btn).on_hover_text("Settings & Info").clicked() {
+                    self.show_settings = !self.show_settings;
+                }
+
+                // A/B comparison pill
+                let ab_text = format!("A/B [{}]", self.ab_slot);
+                let ab_btn = egui::Button::new(
+                    RichText::new(ab_text)
+                        .font(FontId::proportional(10.5))
+                        .color(VST_TEXT_MAIN),
+                )
+                .fill(Color32::from_rgba_unmultiplied(255, 255, 255, 10))
+                .stroke(Stroke::new(1.0_f32, VST_CARD_BORDER))
+                .corner_radius(CornerRadius::same(5))
+                .min_size(egui::vec2(48.0, 24.0));
+                if ui
+                    .add(ab_btn)
+                    .on_hover_text("Toggle between State A and State B")
+                    .clicked()
+                {
+                    self.toggle_ab(ctx);
+                }
+
+                // Preset selector pill: < [Name] >
+                self.preset_navigator(ui, ctx, palette);
+            });
+        });
+    }
+
+    /// Subtitle banner with small waveform glyph
+    fn subtitle_row(&self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+
+            // Small emerald waveform glyph
+            let (glyph_rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 14.0), Sense::hover());
+            let gp = ui.painter();
+            let bars = [4.0, 9.0, 13.0, 8.0, 3.0];
+            for (i, &h) in bars.iter().enumerate() {
+                let x = glyph_rect.left() + i as f32 * 3.2;
+                let mid_y = glyph_rect.center().y;
+                gp.line_segment(
+                    [
+                        egui::pos2(x, mid_y - h * 0.5),
+                        egui::pos2(x, mid_y + h * 0.5),
+                    ],
+                    Stroke::new(1.8_f32, VST_EMERALD),
+                );
+            }
+
+            ui.label(
+                RichText::new("4 mirrored pairs · ±3 to ±12 cents · dry path untouched")
+                    .font(FontId::proportional(10.5))
+                    .color(VST_TEXT_MUTED),
+            );
+        });
+    }
+
+    /// Preset pill navigator with cycle arrows and popup selector
+    fn preset_navigator(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &PluginContext<ThickVoxParams>,
+        _palette: &Palette,
     ) {
         let bank = presets::factory_presets();
         if bank.is_empty() {
             return;
         }
+
         self.preset_index = self.preset_index.min(bank.len() - 1);
         self.applied_preset = self.applied_preset.min(bank.len() - 1);
 
-        let mut index = self.preset_index;
-        ui.add(PresetBrowser::new(&self.preset_items, &mut index).width(210.0));
-
-        if index != self.preset_index {
-            self.preset_index = index;
-            self.applied_preset = index;
-            presets::apply(&bank[index], ctx);
-        } else if let Some(found) = bank
-            .iter()
-            .position(|preset| presets::matches(preset, ctx))
-        {
-            // Follow a preset the host loaded (session restore, the host's
-            // own browser): name the state instead of leaving a stale label.
+        if let Some(found) = bank.iter().position(|preset| presets::matches(preset, ctx)) {
             self.preset_index = found;
             self.applied_preset = found;
         }
 
-        if !presets::matches(&bank[self.preset_index], ctx) {
-            ui.add_space(2.0);
-            ui.label(RichText::new("edited").size(9.0).color(palette.text_dim))
-                .on_hover_text("Parameters differ from the selected preset");
+        let is_edited = !presets::matches(&bank[self.preset_index], ctx);
+
+        let frame = egui::Frame::NONE
+            .fill(VST_CARD_BG)
+            .stroke(Stroke::new(1.0_f32, VST_CARD_BORDER))
+            .corner_radius(CornerRadius::same(5))
+            .inner_margin(egui::Margin::symmetric(4, 2));
+
+        frame.show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+
+                // Previous preset button
+                let prev = ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new("◀")
+                                .font(FontId::proportional(9.0))
+                                .color(VST_TEXT_MUTED),
+                        )
+                        .fill(Color32::TRANSPARENT)
+                        .stroke(Stroke::NONE)
+                        .min_size(egui::vec2(16.0, 18.0)),
+                    )
+                    .clicked();
+                if prev {
+                    let prev_idx = if self.preset_index == 0 {
+                        bank.len() - 1
+                    } else {
+                        self.preset_index - 1
+                    };
+                    self.preset_index = prev_idx;
+                    self.applied_preset = prev_idx;
+                    presets::apply(&bank[prev_idx], ctx);
+                }
+
+                // Preset Name Dropdown
+                let mut current_name = bank[self.preset_index].name.clone();
+                if is_edited {
+                    current_name.push_str(" *");
+                }
+
+                egui::ComboBox::from_id_salt("thickvox_preset_pill_picker")
+                    .selected_text(
+                        RichText::new(current_name)
+                            .font(FontId::proportional(11.0))
+                            .strong()
+                            .color(VST_TEXT_MAIN),
+                    )
+                    .width(135.0)
+                    .show_ui(ui, |ui| {
+                        for (idx, preset) in bank.iter().enumerate() {
+                            let mut selected = self.preset_index == idx;
+                            let label = format!("{}  ·  {}", preset.name, preset.category);
+                            if ui.selectable_value(&mut selected, true, label).clicked() {
+                                self.preset_index = idx;
+                                self.applied_preset = idx;
+                                presets::apply(preset, ctx);
+                            }
+                        }
+                    });
+
+                // Next preset button
+                let next = ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new("▶")
+                                .font(FontId::proportional(9.0))
+                                .color(VST_TEXT_MUTED),
+                        )
+                        .fill(Color32::TRANSPARENT)
+                        .stroke(Stroke::NONE)
+                        .min_size(egui::vec2(16.0, 18.0)),
+                    )
+                    .clicked();
+                if next {
+                    let next_idx = (self.preset_index + 1) % bank.len();
+                    self.preset_index = next_idx;
+                    self.applied_preset = next_idx;
+                    presets::apply(&bank[next_idx], ctx);
+                }
+            });
+        });
+    }
+
+    /// Toggle between A and B comparison slots
+    fn toggle_ab(&mut self, ctx: &PluginContext<ThickVoxParams>) {
+        let current = ParamSnapshot::capture(ctx);
+        if self.ab_slot == 'A' {
+            self.slot_a = Some(current);
+            self.ab_slot = 'B';
+            if let Some(target) = self.slot_b {
+                target.restore(ctx);
+            } else {
+                self.slot_b = Some(current);
+            }
+        } else {
+            self.slot_b = Some(current);
+            self.ab_slot = 'A';
+            if let Some(target) = self.slot_a {
+                target.restore(ctx);
+            }
         }
     }
 
-    /// Meter and wet level: the right-hand strip that shows what the cluster
-    /// above actually produced.
-    fn master_strip(
+    /// Bottom Tray spanning full width: Stereo Imager + Voice Level Slider
+    fn bottom_tray(
         &mut self,
         ui: &mut egui::Ui,
         ctx: &PluginContext<ThickVoxParams>,
-        palette: &Palette,
-        theme: &Theme,
+        size: Vec2,
+        _palette: &Palette,
     ) {
-        ui.vertical(|ui| {
-            ui.set_width(Self::OUTPUT_WIDTH);
+        let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+        let painter = ui.painter();
 
-            let levels = [
-                ChannelLevel::from_linear(ctx.get_meter(ctx.meter_l.id())),
-                ChannelLevel::from_linear(ctx.get_meter(ctx.meter_r.id())),
-            ];
-            let meter = LevelMeter::stereo(&levels)
-                .scale(true)
-                .readout(true)
-                .clip(true)
-                .id(egui::Id::new("thickvox-output-meter"));
-            let meter_width = meter.desired_size(theme).x;
+        // Card frame
+        painter.rect_filled(rect, CornerRadius::same(8), VST_CARD_BG);
+        painter.rect_stroke(
+            rect,
+            CornerRadius::same(8),
+            Stroke::new(1.0_f32, VST_CARD_BORDER),
+            StrokeKind::Inside,
+        );
 
-            let mut db = ctx.voice_level.raw_target() as f32;
+        let content_rect = rect.shrink(10.0);
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(content_rect));
 
-            // Laid out bottom-up: the fader is pinned to the bottom of the
-            // chassis and the meter takes every point left above it, so the
-            // strip ends flush with the fader however tall the window is.
-            ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
-                let fader = Fader::new(&mut db)
-                    .range(-24.0, 6.0)
-                    .taper(Taper::AUDIO)
-                    .reset_db(Some(ctx.voice_level.info.default_plain as f32))
-                    .scale(false)
-                    .id(egui::Id::new("thickvox-voice-level"));
-                let response = ui.add(fader);
-                publish(ctx, &ctx.voice_level, db, &response);
+        child.horizontal_centered(|ui| {
+            let total_w = ui.available_width();
+            let left_w = (total_w * 0.28).max(180.0);
+            let center_w = (total_w * 0.40).max(220.0);
+            let right_w = total_w - left_w - center_w;
 
-                ui.add_space(theme.size.gap());
-                ui.add(SectionHeader::new("VOICE LEVEL").accent(palette.primary));
-                ui.add_space(4.0);
-                correlation_meter(
-                    ui,
-                    ctx.get_meter(ctx.meter_corr.id()),
-                    palette,
-                    Self::OUTPUT_WIDTH,
-                );
-                ui.add_space(6.0);
+            // 1. LEFT: Stereo Imager title & glyph
+            ui.allocate_ui_with_layout(
+                egui::vec2(left_w, ui.available_height()),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.add_space(8.0);
+                    // 4-bar waveform icon
+                    let (icon_rect, _) =
+                        ui.allocate_exact_size(egui::vec2(22.0, 24.0), Sense::hover());
+                    let ip = ui.painter();
+                    let bar_heights = [7.0, 15.0, 21.0, 11.0];
+                    for (i, &h) in bar_heights.iter().enumerate() {
+                        let x = icon_rect.left() + 2.0 + i as f32 * 5.0;
+                        let mid_y = icon_rect.center().y;
+                        ip.line_segment(
+                            [
+                                egui::pos2(x, mid_y - h * 0.5),
+                                egui::pos2(x, mid_y + h * 0.5),
+                            ],
+                            Stroke::new(2.2_f32, VST_EMERALD),
+                        );
+                    }
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("STEREO IMAGER")
+                            .font(FontId::proportional(12.0))
+                            .strong()
+                            .color(VST_TEXT_MAIN),
+                    );
+                },
+            );
 
-                // Room for the output header, its gaps, and one more gap
-                // under the chassis title.
-                let band = ui.available_height() - (theme.size.gap() * 2.0 + 24.0);
-                let meter_height = band.max(120.0);
-                let (strip, _) = ui.allocate_exact_size(
-                    egui::vec2(Self::OUTPUT_WIDTH, meter_height),
-                    Sense::hover(),
-                );
-                let meter_rect = Rect::from_center_size(
-                    strip.center(),
-                    egui::vec2(meter_width, meter_height),
-                );
-                meter.paint(ui, theme, meter_rect);
+            // 2. CENTER: Goniometer vectorscope
+            ui.allocate_ui_with_layout(
+                egui::vec2(center_w, ui.available_height()),
+                egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                |ui| {
+                    let scope_size = (ui.available_height() - 8.0).min(136.0);
+                    ui.add(
+                        Goniometer::new(&self.scope_samples)
+                            .size(scope_size)
+                            .gain(1.8)
+                            .show_grid(true)
+                            .show_correlation(false),
+                    );
+                },
+            );
 
-                ui.add_space(4.0);
-                ui.add(SectionHeader::new("OUTPUT").accent(palette.meter_ok));
-                ui.add_space(theme.size.gap());
-            });
+            // 3. RIGHT: Voice Level slider
+            ui.allocate_ui_with_layout(
+                egui::vec2(right_w, ui.available_height()),
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
+                    ui.add_space(14.0);
+                    let slider_w = (right_w - 120.0).clamp(120.0, 200.0);
+                    voice_level_slider(ui, ctx, slider_w);
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("VOICE LEVEL")
+                            .font(FontId::proportional(11.0))
+                            .strong()
+                            .color(VST_TEXT_MUTED),
+                    );
+                },
+            );
         });
     }
 }
 
-/// A titled group: accent rule, then its controls on one row, centered under
-/// the rule so a two-knob section doesn't leave its contents hanging off one
-/// edge of a four-knob-wide column.
-fn section(
+/// Helper that renders a card container with rounded corners, subtle border,
+/// and signature emerald pill header.
+fn render_card<R>(
     ui: &mut egui::Ui,
     title: &str,
-    accent: Color32,
-    knob_width: f32,
-    knobs: usize,
-    add_controls: impl FnOnce(&mut egui::Ui),
-) {
-    ui.add_space(6.0);
-    ui.add(SectionHeader::new(title).accent(accent));
-    ui.add_space(4.0);
+    size: Vec2,
+    palette: &Palette,
+    content: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    let painter = ui.painter();
 
-    let spacing = ui.spacing().item_spacing.x * (knobs.saturating_sub(1)) as f32;
-    let row = knob_width * knobs as f32 + spacing;
-    // A single-control section is a two-ended row (one knob, one toggle), so
-    // it hangs off the left edge instead of the dial floating mid-column.
-    let pad = if knobs == 1 {
-        0.0
-    } else {
-        ((ui.available_width() - row) * 0.5).max(0.0)
-    };
-    ui.horizontal(|ui| {
-        ui.add_space(pad);
-        add_controls(ui);
-    });
+    // Background & border
+    painter.rect_filled(rect, CornerRadius::same(8), VST_CARD_BG);
+    painter.rect_stroke(
+        rect,
+        CornerRadius::same(8),
+        Stroke::new(1.0_f32, VST_CARD_BORDER),
+        StrokeKind::Inside,
+    );
+
+    // Accent pill
+    let pill_rect = Rect::from_min_size(
+        egui::pos2(rect.left() + 14.0, rect.top() + 14.0),
+        egui::vec2(3.5, 13.0),
+    );
+    painter.rect_filled(pill_rect, CornerRadius::same(2), VST_EMERALD);
+
+    // Header Title
+    painter.text(
+        egui::pos2(rect.left() + 23.0, rect.top() + 13.0),
+        egui::Align2::LEFT_TOP,
+        title,
+        FontId::proportional(11.5),
+        palette.foreground,
+    );
+
+    // Inner content area
+    let content_rect = Rect::from_min_max(
+        egui::pos2(rect.left() + 12.0, rect.top() + 38.0),
+        egui::pos2(rect.right() - 12.0, rect.bottom() - 10.0),
+    );
+
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(content_rect));
+    content(&mut child)
 }
 
-/// Compact output-correlation bar: -1 (anti-phase) on the left, 0 in the
-/// middle, +1 (mono) on the right.
-///
-/// The value is the raw meter lane, not a 0..1 level. A needle at the centre
-/// is a very wide image, hard right is mono-compatible, and anything left of
-/// centre will partially cancel when the mix is folded down.
-fn correlation_meter(
+/// Custom styled emerald checkbox
+fn emerald_checkbox(ui: &mut egui::Ui, value: &mut bool, label: &str) -> egui::Response {
+    let font = FontId::proportional(12.0);
+    let box_size = 18.0_f32;
+    let text_size = ui
+        .painter()
+        .layout_no_wrap(label.to_string(), font.clone(), VST_TEXT_MAIN)
+        .size();
+
+    let total_w = box_size + 8.0 + text_size.x;
+    let (rect, mut response) = ui.allocate_exact_size(egui::vec2(total_w, 22.0), Sense::click());
+
+    if response.clicked() {
+        *value = !*value;
+        response.mark_changed();
+    }
+
+    let box_rect = Rect::from_center_size(
+        egui::pos2(rect.left() + box_size * 0.5, rect.center().y),
+        egui::vec2(box_size, box_size),
+    );
+
+    let painter = ui.painter();
+    if *value {
+        painter.rect_filled(box_rect, CornerRadius::same(4), VST_EMERALD);
+        // White checkmark
+        let p1 = egui::pos2(box_rect.left() + 4.5, box_rect.center().y);
+        let p2 = egui::pos2(box_rect.left() + 7.5, box_rect.bottom() - 5.0);
+        let p3 = egui::pos2(box_rect.right() - 4.5, box_rect.top() + 5.0);
+        painter.line_segment(
+            [p1, p2],
+            Stroke::new(2.0_f32, Color32::from_rgb(12, 16, 22)),
+        );
+        painter.line_segment(
+            [p2, p3],
+            Stroke::new(2.0_f32, Color32::from_rgb(12, 16, 22)),
+        );
+    } else {
+        painter.rect_filled(
+            box_rect,
+            CornerRadius::same(4),
+            Color32::from_rgb(22, 27, 36),
+        );
+        painter.rect_stroke(
+            box_rect,
+            CornerRadius::same(4),
+            Stroke::new(1.2_f32, Color32::from_rgb(60, 72, 90)),
+            StrokeKind::Inside,
+        );
+    }
+
+    painter.text(
+        egui::pos2(box_rect.right() + 8.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        font,
+        VST_TEXT_MAIN,
+    );
+
+    response.on_hover_text("Collapse the wet cluster into Mid for mono-safe density")
+}
+
+/// Horizontal slider for Voice Level
+fn voice_level_slider(
     ui: &mut egui::Ui,
-    correlation: f32,
-    palette: &Palette,
+    ctx: &PluginContext<ThickVoxParams>,
     width: f32,
 ) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 24.0), Sense::hover());
-    let bar = Rect::from_min_size(rect.min, egui::vec2(rect.width(), 7.0));
+    let desired_size = egui::vec2(width, 24.0);
+    let (rect, response) = ui.allocate_exact_size(desired_size, Sense::click_and_drag());
 
-    let color = if correlation < -0.1 {
-        palette.destructive
+    let param = &ctx.voice_level;
+    let min = param.info.range.min() as f32; // -24.0
+    let max = param.info.range.max() as f32; // 6.0
+    let default = param.info.default_plain as f32; // -8.0
+    let mut db = param.raw_target() as f32;
+
+    let id = param.id();
+    if response.drag_started() {
+        ctx.begin_edit(id);
+    }
+    if response.dragged() || response.clicked() {
+        if let Some(pos) = response.interact_pointer_pos() {
+            let t = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+            db = min + t * (max - min);
+            ctx.set_param(id, param.info.range.normalize(f64::from(db)));
+        }
+    }
+    if response.double_clicked() {
+        db = default;
+        ctx.set_param(id, param.info.range.normalize(f64::from(db)));
+    }
+    if response.drag_stopped() {
+        ctx.end_edit(id);
+    }
+
+    let painter = ui.painter();
+    let track_rect = Rect::from_center_size(rect.center(), egui::vec2(rect.width(), 6.0));
+    painter.rect_filled(track_rect, CornerRadius::same(3), VST_TRACK_BG);
+
+    let t = ((db - min) / (max - min)).clamp(0.0, 1.0);
+    let fill_rect = Rect::from_min_max(
+        track_rect.min,
+        egui::pos2(
+            track_rect.left() + t * track_rect.width(),
+            track_rect.bottom(),
+        ),
+    );
+    if fill_rect.width() > 1.0 {
+        painter.rect_filled(fill_rect, CornerRadius::same(3), VST_EMERALD);
+    }
+
+    // Thumb handle
+    let thumb_center = egui::pos2(track_rect.left() + t * track_rect.width(), rect.center().y);
+    painter.circle_filled(
+        thumb_center + egui::vec2(0.0, 1.0),
+        7.0,
+        Color32::from_black_alpha(80),
+    );
+    painter.circle_filled(thumb_center, 7.0, Color32::WHITE);
+    painter.circle_stroke(
+        thumb_center,
+        7.0,
+        Stroke::new(1.0_f32, Color32::from_rgb(200, 215, 230)),
+    );
+
+    response.on_hover_text(format!(
+        "Voice Level: {db:+.1} dB\nDouble-click to reset ({default:+.1} dB)"
+    ))
+}
+
+/// Output correlation strip underneath the stereo meter
+fn correlation_strip(ui: &mut egui::Ui, correlation: f32, width: f32) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 24.0), Sense::hover());
+    let bar = Rect::from_min_size(
+        egui::pos2(rect.left() + 38.0, rect.top() + 6.0),
+        egui::vec2(rect.width() - 84.0, 6.5),
+    );
+
+    let color = if correlation < -0.05 {
+        Color32::from_rgb(255, 80, 80)
     } else if correlation < 0.35 {
-        palette.meter_warn
+        Color32::from_rgb(255, 180, 50)
     } else {
-        palette.meter_ok
+        VST_EMERALD
     };
 
     let painter = ui.painter();
-    painter.rect_filled(bar, 3.0, palette.track);
+
+    // Label on left
+    painter.text(
+        egui::pos2(rect.left(), rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        "CORR",
+        FontId::proportional(10.0),
+        VST_TEXT_MUTED,
+    );
+
+    // Track
+    painter.rect_filled(bar, CornerRadius::same(3), VST_TRACK_BG);
 
     let center = bar.center().x;
     let needle = bar.left() + (correlation.clamp(-1.0, 1.0) + 1.0) * 0.5 * bar.width();
     if (needle - center).abs() > 0.5 {
         let fill = Rect::from_min_max(
-            egui::pos2(center.min(needle), bar.top() + 1.0),
-            egui::pos2(center.max(needle), bar.bottom() - 1.0),
+            egui::pos2(center.min(needle), bar.top() + 0.5),
+            egui::pos2(center.max(needle), bar.bottom() - 0.5),
         );
-        painter.rect_filled(fill, 1.0, color);
+        painter.rect_filled(fill, CornerRadius::same(1), color);
     }
     painter.line_segment(
         [
             egui::pos2(center, bar.top() - 1.0),
             egui::pos2(center, bar.bottom() + 1.0),
         ],
-        egui::Stroke::new(1.0_f32, palette.text_dim),
+        Stroke::new(1.0_f32, Color32::from_rgb(70, 80, 95)),
     );
 
-    let label_pos = egui::pos2(bar.left(), bar.bottom() + 2.0);
+    // Readout on right
     painter.text(
-        label_pos,
-        egui::Align2::LEFT_TOP,
-        "CORR",
-        egui::FontId::proportional(8.5),
-        palette.text_dim,
-    );
-    painter.text(
-        egui::pos2(bar.right(), bar.bottom() + 2.0),
-        egui::Align2::RIGHT_TOP,
+        egui::pos2(rect.right(), rect.center().y),
+        egui::Align2::RIGHT_CENTER,
         format!("{correlation:+.2}"),
-        egui::FontId::monospace(9.0),
+        FontId::monospace(10.5),
         color,
     );
 
     response.on_hover_text(
         "Output L/R correlation\n\
-         +1 = mono · 0 = very wide · negative = phase cancellation when folded",
+         +1.00 = mono · 0.00 = wide stereo · negative = phase cancellation",
     )
 }
 
-/// The chassis power switch. It reads ON/BYP rather than a checkbox so the
-/// state is legible at a glance from across a console.
-fn power_switch(ui: &mut egui::Ui, ctx: &PluginContext<ThickVoxParams>, palette: &Palette) {
+/// The chassis power switch pill: "ON" in bright emerald when engaged, "BYP" in dark red when bypassed.
+fn power_switch(ui: &mut egui::Ui, ctx: &PluginContext<ThickVoxParams>) {
     let engaged = !ctx.bypass.value();
-    let (label, color, hint) = if engaged {
-        ("ON", palette.meter_ok, "Bypass ThickVox")
+    let (label, bg, fg, border) = if engaged {
+        (
+            "ON",
+            VST_EMERALD,
+            Color32::from_rgb(10, 15, 20),
+            VST_EMERALD,
+        )
     } else {
-        ("BYP", palette.destructive, "Engage ThickVox")
+        (
+            "BYP",
+            Color32::from_rgb(45, 16, 20),
+            Color32::from_rgb(255, 80, 80),
+            Color32::from_rgb(180, 40, 50),
+        )
     };
+
     let button = egui::Button::new(
         RichText::new(label)
-            .font(egui::FontId::proportional(10.0))
+            .font(FontId::proportional(11.0))
             .strong()
-            .color(color),
+            .color(fg),
     )
-    .fill(with_alpha(color, 0.14))
-    .stroke(egui::Stroke::new(1.0_f32, with_alpha(color, 0.55)))
-    .min_size(egui::vec2(36.0, 20.0));
+    .fill(bg)
+    .stroke(Stroke::new(1.0_f32, border))
+    .corner_radius(CornerRadius::same(5))
+    .min_size(egui::vec2(38.0, 24.0));
 
-    if ui.add(button).on_hover_text(hint).clicked() {
-        // A click is a complete gesture, so it goes through `automate`
-        // rather than a bare parameter write.
+    if ui
+        .add(button)
+        .on_hover_text(if engaged {
+            "Bypass ThickVox"
+        } else {
+            "Engage ThickVox"
+        })
+        .clicked()
+    {
         ctx.automate(ctx.bypass.id(), f64::from(u8::from(engaged)));
     }
 }
@@ -778,8 +1484,7 @@ fn power_switch(ui: &mut egui::Ui, ctx: &PluginContext<ThickVoxParams>, palette:
 // Editor helpers
 // ---------------------------------------------------------------------------
 
-/// A 0..100% knob. `display_scale` converts the parameter's plain unit to
-/// percent (1.0 for 0..1 params, 100.0 for 0..100 params).
+/// A 0..100% knob with custom diameter
 fn percent_knob(
     ui: &mut egui::Ui,
     ctx: &PluginContext<ThickVoxParams>,
@@ -787,6 +1492,7 @@ fn percent_knob(
     label: &'static str,
     display: (f32, f32),
     display_scale: f32,
+    diameter: f32,
 ) {
     param_knob(
         ui,
@@ -801,10 +1507,11 @@ fn percent_knob(
                 unit: Some("%"),
             },
         },
+        diameter,
     );
 }
 
-/// A knob in the parameter's own units (Hz, cents multiplier, ...).
+/// A knob in the parameter's own units (Hz, cents multiplier, ...) with custom diameter
 fn unit_knob(
     ui: &mut egui::Ui,
     ctx: &PluginContext<ThickVoxParams>,
@@ -813,6 +1520,7 @@ fn unit_knob(
     display: (f32, f32),
     decimals: usize,
     unit: &'static str,
+    diameter: f32,
 ) {
     param_knob(
         ui,
@@ -827,16 +1535,18 @@ fn unit_knob(
                 unit: Some(unit),
             },
         },
+        diameter,
     );
 }
 
-/// A knob that reads in decibels (`-inf dB` included, rather than `-inf`).
+/// A knob that reads in decibels with custom diameter
 fn db_knob(
     ui: &mut egui::Ui,
     ctx: &PluginContext<ThickVoxParams>,
     param: &FloatParam,
     label: &'static str,
     display: (f32, f32),
+    diameter: f32,
 ) {
     param_knob(
         ui,
@@ -848,6 +1558,7 @@ fn db_knob(
             display_scale: 1.0,
             reading: Reading::Db,
         },
+        diameter,
     );
 }
 
@@ -864,6 +1575,7 @@ fn param_knob(
     ctx: &PluginContext<ThickVoxParams>,
     param: &FloatParam,
     spec: KnobSpec,
+    diameter: f32,
 ) {
     let mut shown = (param.raw_target() as f32) * spec.display_scale;
     let response = ui.add(
@@ -871,8 +1583,8 @@ fn param_knob(
             .range(spec.display.0, spec.display.1)
             .label(spec.label)
             .reading(spec.reading)
-            // Double-click returns to the parameter's declared default, which
-            // is the value the host's "reset" shows too.
+            .diameter(diameter)
+            .scale(true)
             .reset(Some((param.info.default_plain as f32) * spec.display_scale)),
     );
     publish(ctx, param, shown / spec.display_scale, &response);
