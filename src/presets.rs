@@ -1,15 +1,14 @@
-//! Factory-preset table for the editor's preset picker.
+//! Factory and User preset table for the editor's preset picker.
 //!
-//! The `.preset` files under `presets/` are the single source of truth:
-//! they are embedded at compile time, so the picker can never drift from
-//! what `cargo truce build` ships in the bundle. They are parsed once, on
-//! the first editor open, and never touched from the audio thread.
+//! The `.preset` files under `presets/` are embedded at compile time for factory presets.
+//! User-created presets are loaded from and saved to `~/.config/thickvox/presets/<Category>/<Name>.preset`.
 //!
 //! A preset stores *plain* values (the units on the knobs). Applying one
 //! goes through the host bridge with `begin_edit` / `set_param` /
 //! `end_edit`, and the range's own normalization supplies the taper, so a
 //! preset writes exactly what turning the knob to that value would write.
 
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use truce::core::PluginContext;
@@ -17,14 +16,20 @@ use truce::params::FloatParam;
 
 use crate::ThickVoxParams;
 
-/// One factory preset, parsed from its author-facing `.preset` file.
-pub(crate) struct FactoryPreset {
+/// One factory or user preset.
+#[derive(Clone, Debug)]
+pub(crate) struct Preset {
     pub(crate) name: String,
-    pub(crate) category: &'static str,
+    pub(crate) category: String,
     #[allow(dead_code)]
     pub(crate) author: Option<String>,
     /// The library's "init" sound. Exactly one factory preset sets this.
     pub(crate) default: bool,
+    /// Whether this is a user-saved preset loaded from disk.
+    pub(crate) is_user: bool,
+    /// Absolute path on disk (for user presets).
+    #[allow(dead_code)]
+    pub(crate) path: Option<PathBuf>,
     /// `(parameter id, plain value)`, in file order.
     pub(crate) params: Vec<(u32, f64)>,
 }
@@ -48,29 +53,255 @@ const PRESET_FILES: &[(&str, &str)] = &[
     ),
 ];
 
-/// Every factory preset, parsed on first use.
-pub(crate) fn factory_presets() -> &'static [FactoryPreset] {
-    static PRESETS: OnceLock<Vec<FactoryPreset>> = OnceLock::new();
+/// Embedded factory presets, parsed once.
+pub(crate) fn factory_presets() -> &'static [Preset] {
+    static PRESETS: OnceLock<Vec<Preset>> = OnceLock::new();
     PRESETS.get_or_init(|| {
         PRESET_FILES
             .iter()
-            .filter_map(|&(category, source)| parse(category, source))
+            .filter_map(|&(category, source)| parse(category.to_string(), source, false, None))
             .collect()
     })
 }
 
-/// Index of the preset marked `default = true`, or 0 when none is.
-pub(crate) fn default_index() -> usize {
-    factory_presets()
-        .iter()
-        .position(|preset| preset.default)
+/// Resolves `~/.config/thickvox/presets` directory.
+pub(crate) fn user_presets_dir() -> Option<PathBuf> {
+    if let Some(home) = std::env::var_os("HOME") {
+        Some(
+            PathBuf::from(home)
+                .join(".config")
+                .join("thickvox")
+                .join("presets"),
+        )
+    } else if let Some(userprofile) = std::env::var_os("USERPROFILE") {
+        Some(
+            PathBuf::from(userprofile)
+                .join(".config")
+                .join("thickvox")
+                .join("presets"),
+        )
+    } else {
+        None
+    }
+}
+
+/// Discovers both embedded factory presets and all user presets on disk.
+pub(crate) fn all_presets() -> Vec<Preset> {
+    let mut list = factory_presets().to_vec();
+    if let Some(base) = user_presets_dir() {
+        if base.exists() {
+            scan_user_presets(&base, &mut list);
+        }
+    }
+    list
+}
+
+/// Scans the given directory for `.preset` files and subdirectories.
+pub(crate) fn scan_user_presets(base: &Path, list: &mut Vec<Preset>) {
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return;
+    };
+
+    let mut user_presets = Vec::new();
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("preset") {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if let Some(p) = parse("User".to_string(), &content, true, Some(path)) {
+                    user_presets.push(p);
+                }
+            }
+        } else if path.is_dir() {
+            let cat_name = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("User")
+                .to_string();
+            if let Ok(sub_entries) = std::fs::read_dir(&path) {
+                for sub in sub_entries.flatten() {
+                    let sub_path = sub.path();
+                    if sub_path.is_file()
+                        && sub_path.extension().and_then(|s| s.to_str()) == Some("preset")
+                    {
+                        if let Ok(content) = std::fs::read_to_string(&sub_path) {
+                            if let Some(p) = parse(cat_name.clone(), &content, true, Some(sub_path))
+                            {
+                                user_presets.push(p);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    user_presets.sort_by(|a, b| {
+        a.category
+            .cmp(&b.category)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+
+    list.extend(user_presets);
+}
+
+/// Checks whether a user preset file with `name` exists under `category`.
+pub(crate) fn user_preset_exists(name: &str, category: &str) -> bool {
+    let trimmed_name = name.trim();
+    if trimmed_name.is_empty() {
+        return false;
+    }
+    let cat = if category.trim().is_empty() {
+        "User"
+    } else {
+        category.trim()
+    };
+    if let Some(base) = user_presets_dir() {
+        base.join(cat)
+            .join(format!("{trimmed_name}.preset"))
+            .exists()
+    } else {
+        false
+    }
+}
+
+/// Saves the current plugin parameters as a user `.preset` file.
+pub(crate) fn save_user_preset(
+    name: &str,
+    category: &str,
+    author: &str,
+    params: &ThickVoxParams,
+) -> Result<PathBuf, String> {
+    let trimmed_name = name.trim();
+    if trimmed_name.is_empty() {
+        return Err("Preset name cannot be empty".to_string());
+    }
+    let cat = if category.trim().is_empty() {
+        "User"
+    } else {
+        category.trim()
+    };
+    let author = if author.trim().is_empty() {
+        "User"
+    } else {
+        author.trim()
+    };
+
+    let base =
+        user_presets_dir().ok_or_else(|| "Could not determine user directory".to_string())?;
+    let dir = base.join(cat);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create folder: {e}"))?;
+
+    let file_path = dir.join(format!("{trimmed_name}.preset"));
+    let content = serialize(trimmed_name, cat, author, params);
+    std::fs::write(&file_path, content).map_err(|e| format!("Failed to write preset file: {e}"))?;
+
+    Ok(file_path)
+}
+
+/// Serializes current parameter values into `.preset` TOML format.
+pub(crate) fn serialize(
+    name: &str,
+    category: &str,
+    author: &str,
+    params: &ThickVoxParams,
+) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0x8421_1248_dead_beef);
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
+        ^ COUNTER.fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::Relaxed);
+
+    let uuid = format!(
+        "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
+        (seed >> 32) as u32,
+        (seed >> 16) as u16,
+        seed as u16 & 0x0fff,
+        0x8000 | ((seed >> 48) as u16 & 0x3fff),
+        seed & 0xffff_ffff_ffff,
+    );
+
+    let mut out = String::new();
+    out.push_str(&format!("uuid = \"{uuid}\"\n"));
+    out.push_str(&format!("name = \"{}\"\n", name.replace('"', "\\\"")));
+    out.push_str(&format!("author = \"{}\"\n", author.replace('"', "\\\"")));
+    out.push_str(&format!(
+        "category = \"{}\"\n",
+        category.replace('"', "\\\"")
+    ));
+    out.push_str("tags = [\"user\"]\ndefault = false\n\n[params]\n");
+    out.push_str(&format!("0 = {:.3}   # Mix\n", params.mix.raw_target()));
+    out.push_str(&format!(
+        "1 = {:.2}   # Detune Depth\n",
+        params.detune_depth.raw_target()
+    ));
+    out.push_str(&format!(
+        "2 = {:.2}   # Delay Spread\n",
+        params.delay_spread.raw_target()
+    ));
+    out.push_str(&format!(
+        "4 = {:.2}   # Stereo Width\n",
+        params.width.raw_target()
+    ));
+    out.push_str(&format!(
+        "5 = {:.1}   # Voice Level\n",
+        params.voice_level.raw_target()
+    ));
+    out.push_str(&format!(
+        "6 = {:.0}   # Side HPF\n",
+        params.side_hpf.raw_target()
+    ));
+    out.push_str(&format!("7 = {:.1}   # Air\n", params.air.raw_target()));
+    out.push_str(&format!("8 = {}  # Mid Only\n", params.mid_only.value()));
+    out.push_str(&format!(
+        "10 = {:.2}  # Pair 1 Spread\n",
+        params.pair1_spread.raw_target()
+    ));
+    out.push_str(&format!(
+        "11 = {:.2}  # Pair 2 Spread\n",
+        params.pair2_spread.raw_target()
+    ));
+    out.push_str(&format!(
+        "12 = {:.2}  # Pair 3 Spread\n",
+        params.pair3_spread.raw_target()
+    ));
+    out.push_str(&format!(
+        "13 = {:.2}  # Pair 4 Spread\n",
+        params.pair4_spread.raw_target()
+    ));
+    out
+}
+
+/// Reveals the presets directory in the platform's file manager.
+pub(crate) fn reveal_presets_in_finder() {
+    if let Some(base) = user_presets_dir() {
+        let _ = std::fs::create_dir_all(&base);
+        #[cfg(target_os = "macos")]
+        {
+            let _ = std::process::Command::new("open").arg(&base).spawn();
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let _ = std::process::Command::new("explorer").arg(&base).spawn();
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            let _ = std::process::Command::new("xdg-open").arg(&base).spawn();
+        }
+    }
+}
+
+/// Index of the preset marked `default = true`, or 0 when none is.
+pub(crate) fn default_index(bank: &[Preset]) -> usize {
+    bank.iter().position(|preset| preset.default).unwrap_or(0)
 }
 
 /// Write every value in `preset` to the host, one complete gesture per
 /// parameter. Unknown ids are ignored so an old file cannot drive a
 /// parameter that has since been retired.
-pub(crate) fn apply(preset: &FactoryPreset, ctx: &PluginContext<ThickVoxParams>) {
+pub(crate) fn apply(preset: &Preset, ctx: &PluginContext<ThickVoxParams>) {
     for &(id, plain) in &preset.params {
         match id {
             0 => automate(ctx, &ctx.mix, plain),
@@ -102,7 +333,7 @@ fn automate(ctx: &PluginContext<ThickVoxParams>, param: &FloatParam, plain: f64)
 /// loaded by the host, the picker should name the preset the state landed
 /// on. Normalized round-trips are not bit-exact, so compare with a small
 /// relative tolerance rather than `==`.
-pub(crate) fn matches(preset: &FactoryPreset, params: &ThickVoxParams) -> bool {
+pub(crate) fn matches(preset: &Preset, params: &ThickVoxParams) -> bool {
     preset.params.iter().all(|&(id, plain)| match id {
         0 => close(params.mix.raw_target(), plain),
         1 => close(params.detune_depth.raw_target(), plain),
@@ -130,9 +361,15 @@ fn close(actual: f64, expected: f64) -> bool {
 /// `[params]` table of `id = number|bool` entries. Arrays (`tags`) and
 /// unknown keys are ignored, which is what keeps this parser from growing
 /// into a TOML dependency.
-fn parse(category: &'static str, source: &str) -> Option<FactoryPreset> {
+fn parse(
+    default_category: String,
+    source: &str,
+    is_user: bool,
+    path: Option<PathBuf>,
+) -> Option<Preset> {
     let mut name = None;
     let mut author = None;
+    let mut category = None;
     let mut default = false;
     let mut params = Vec::new();
     let mut in_params = false;
@@ -168,6 +405,7 @@ fn parse(category: &'static str, source: &str) -> Option<FactoryPreset> {
         } else {
             match key {
                 "name" => name = Some(unquote(value)),
+                "category" => category = Some(unquote(value)),
                 "author" => author = Some(unquote(value)),
                 "default" => default = value == "true",
                 _ => {}
@@ -175,11 +413,13 @@ fn parse(category: &'static str, source: &str) -> Option<FactoryPreset> {
         }
     }
 
-    Some(FactoryPreset {
+    Some(Preset {
         name: name.filter(|name| !name.is_empty())?,
-        category,
+        category: category.unwrap_or(default_category),
         author,
         default,
+        is_user,
+        path,
         params,
     })
 }
@@ -286,11 +526,12 @@ mod tests {
     #[test]
     fn parser_ignores_comments_and_unknown_keys() {
         let preset = parse(
-            "Test",
+            "Test".to_string(),
             r#"
             uuid = "x"
             name = "Leading Space"   # trailing comment
             author = "A # not-a-comment"
+            category = "Custom"
             tags = ["one", "two"]
             default = true
 
@@ -299,11 +540,74 @@ mod tests {
             8 = false
             9 = true
             "#,
+            false,
+            None,
         )
         .unwrap();
         assert_eq!(preset.name, "Leading Space");
         assert_eq!(preset.author.as_deref(), Some("A # not-a-comment"));
+        assert_eq!(preset.category, "Custom");
         assert!(preset.default);
         assert_eq!(preset.params, vec![(0, 0.5), (8, 0.0), (9, 1.0)]);
+    }
+
+    #[test]
+    fn user_preset_scan_and_parse_roundtrip() {
+        let temp_dir = std::env::temp_dir().join(format!("thickvox_test_{}", std::process::id()));
+        let leads_dir = temp_dir.join("Leads");
+        std::fs::create_dir_all(&leads_dir).unwrap();
+
+        let preset_content = r#"
+        uuid = "test-1234"
+        name = "Silky Lead"
+        author = "Test Suite"
+        category = "Leads"
+
+        [params]
+        0 = 0.40
+        1 = 1.20
+        2 = 0.95
+        4 = 1.50
+        5 = -6.0
+        6 = 140.0
+        7 = 2.5
+        8 = false
+        10 = 0.8
+        11 = 0.8
+        12 = 0.8
+        13 = 0.8
+        "#;
+        std::fs::write(leads_dir.join("Silky Lead.preset"), preset_content).unwrap();
+
+        let mut list = Vec::new();
+        scan_user_presets(&temp_dir, &mut list);
+
+        assert_eq!(list.len(), 1);
+        let p = &list[0];
+        assert_eq!(p.name, "Silky Lead");
+        assert_eq!(p.category, "Leads");
+        assert!(p.is_user);
+        assert_eq!(p.params.len(), 12);
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn user_preset_serialize_and_parse() {
+        let params = ThickVoxParams::default();
+
+        let serialized = serialize("My Vocal Sound", "Lead", "Producer X", &params);
+        assert!(serialized.contains("name = \"My Vocal Sound\""));
+        assert!(serialized.contains("category = \"Lead\""));
+        assert!(serialized.contains("author = \"Producer X\""));
+        assert!(serialized.contains("[params]"));
+
+        let parsed = parse("Lead".to_string(), &serialized, true, None).unwrap();
+        assert_eq!(parsed.name, "My Vocal Sound");
+        assert_eq!(parsed.category, "Lead");
+        assert_eq!(parsed.author.as_deref(), Some("Producer X"));
+        assert!(parsed.is_user);
+        assert_eq!(parsed.params.len(), 12);
+        assert!(matches(&parsed, &params));
     }
 }

@@ -360,7 +360,12 @@ impl PluginLogic for ThickVox {
     // vocal and destroy the intended ADT offset.
 
     fn editor(params: Arc<ThickVoxParams>) -> Box<dyn Editor> {
-        Box::new(EguiEditor::with_ui(params, (1020, 650), ThickVoxEditor::new()).resizable(false))
+        Box::new(
+            EguiEditor::with_ui(params, (900, 600), ThickVoxEditor::new())
+                .resizable(true)
+                .min_size((760, 480))
+                .max_size((1800, 1200)),
+        )
     }
 }
 
@@ -455,6 +460,7 @@ impl ParamSnapshot {
 /// Custom egui editor built as a premium landscape VST plugin interface.
 struct ThickVoxEditor {
     theme_installed: bool,
+    bank: Vec<presets::Preset>,
     preset_index: usize,
     applied_preset: usize,
     scope_samples: Vec<StereoSample>,
@@ -464,13 +470,21 @@ struct ThickVoxEditor {
     slot_b: Option<ParamSnapshot>,
     // Settings modal toggle
     show_settings: bool,
+    // Save preset modal toggle and fields
+    show_save_modal: bool,
+    save_name: String,
+    save_category: String,
+    save_author: String,
+    save_error: Option<String>,
 }
 
 impl ThickVoxEditor {
     fn new() -> Self {
-        let default = presets::default_index();
+        let bank = presets::all_presets();
+        let default = presets::default_index(&bank);
         Self {
             theme_installed: false,
+            bank,
             preset_index: default,
             applied_preset: default,
             scope_samples: Vec::with_capacity(crate::dsp::stereo_imager::DEFAULT_SCOPE_CAPACITY),
@@ -478,6 +492,11 @@ impl ThickVoxEditor {
             slot_a: None,
             slot_b: None,
             show_settings: false,
+            show_save_modal: false,
+            save_name: String::new(),
+            save_category: "User".to_string(),
+            save_author: "User".to_string(),
+            save_error: None,
         }
     }
 }
@@ -544,6 +563,165 @@ impl EditorUi<ThickVoxParams> for ThickVoxEditor {
                     }
                 });
         }
+
+        // Save preset modal
+        if self.show_save_modal {
+            let mut close_modal = false;
+            egui::Window::new("Save User Preset")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .fixed_size(egui::vec2(380.0, 240.0))
+                .show(ui.ctx(), |ui| {
+                    ui.spacing_mut().item_spacing.y = 8.0;
+
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("SAVE USER PRESET")
+                                .strong()
+                                .color(VST_EMERALD)
+                                .size(13.0),
+                        );
+                    });
+                    ui.separator();
+
+                    egui::Grid::new("save_preset_grid")
+                        .num_columns(2)
+                        .spacing([12.0, 8.0])
+                        .show(ui, |ui| {
+                            ui.label(RichText::new("Name:").color(VST_TEXT_MAIN));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.save_name)
+                                    .hint_text("Preset name")
+                                    .desired_width(220.0),
+                            );
+                            ui.end_row();
+
+                            ui.label(RichText::new("Category:").color(VST_TEXT_MAIN));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.save_category)
+                                    .hint_text("User, Lead, Harmony, etc.")
+                                    .desired_width(220.0),
+                            );
+                            ui.end_row();
+
+                            ui.label(RichText::new("Author:").color(VST_TEXT_MAIN));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.save_author)
+                                    .hint_text("Your name")
+                                    .desired_width(220.0),
+                            );
+                            ui.end_row();
+                        });
+
+                    let trimmed_name = self.save_name.trim();
+                    let cat = if self.save_category.trim().is_empty() {
+                        "User"
+                    } else {
+                        self.save_category.trim()
+                    };
+                    let exists = presets::user_preset_exists(trimmed_name, cat);
+
+                    if exists {
+                        ui.label(
+                            RichText::new(format!(
+                                "⚠️ \"{trimmed_name}\" already exists in \"{cat}\". Overwrite?"
+                            ))
+                            .color(Color32::from_rgb(255, 189, 46))
+                            .font(FontId::proportional(11.0)),
+                        );
+                    }
+
+                    if let Some(err) = &self.save_error {
+                        ui.label(
+                            RichText::new(format!("❌ {err}"))
+                                .color(Color32::from_rgb(255, 95, 86))
+                                .font(FontId::proportional(11.0)),
+                        );
+                    }
+
+                    ui.add_space(4.0);
+                    ui.separator();
+
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(
+                                RichText::new("📁 Presets Folder")
+                                    .font(FontId::proportional(11.0))
+                                    .color(VST_TEXT_MUTED),
+                            )
+                            .on_hover_text("Open presets directory in system file manager")
+                            .clicked()
+                        {
+                            presets::reveal_presets_in_finder();
+                        }
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let save_label = if exists { "Overwrite" } else { "Save" };
+                            let save_btn = egui::Button::new(
+                                RichText::new(save_label)
+                                    .font(FontId::proportional(11.5))
+                                    .strong()
+                                    .color(Color32::from_rgb(12, 14, 18)),
+                            )
+                            .fill(if exists {
+                                Color32::from_rgb(255, 189, 46)
+                            } else {
+                                VST_EMERALD
+                            })
+                            .corner_radius(CornerRadius::same(5))
+                            .min_size(egui::vec2(72.0, 24.0));
+
+                            if ui.add_enabled(!trimmed_name.is_empty(), save_btn).clicked() {
+                                match presets::save_user_preset(
+                                    trimmed_name,
+                                    cat,
+                                    &self.save_author,
+                                    ctx,
+                                ) {
+                                    Ok(_) => {
+                                        self.bank = presets::all_presets();
+                                        if let Some(idx) = self.bank.iter().position(|p| {
+                                            p.is_user
+                                                && p.name.eq_ignore_ascii_case(trimmed_name)
+                                                && p.category.eq_ignore_ascii_case(cat)
+                                        }) {
+                                            self.preset_index = idx;
+                                            self.applied_preset = idx;
+                                        }
+                                        self.save_error = None;
+                                        close_modal = true;
+                                    }
+                                    Err(e) => {
+                                        self.save_error = Some(e);
+                                    }
+                                }
+                            }
+
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new("Cancel")
+                                            .font(FontId::proportional(11.5))
+                                            .color(VST_TEXT_MUTED),
+                                    )
+                                    .fill(Color32::from_rgba_unmultiplied(255, 255, 255, 10))
+                                    .corner_radius(CornerRadius::same(5))
+                                    .min_size(egui::vec2(60.0, 24.0)),
+                                )
+                                .clicked()
+                            {
+                                self.save_error = None;
+                                close_modal = true;
+                            }
+                        });
+                    });
+                });
+
+            if close_modal {
+                self.show_save_modal = false;
+            }
+        }
     }
 }
 
@@ -568,7 +746,7 @@ impl ThickVoxEditor {
         let avail_h = ui.available_height();
 
         let bottom_tray_h = 136.0_f32;
-        let gap = 12.0_f32;
+        let gap = 4.0_f32;
         let upper_grid_h = (avail_h - bottom_tray_h - gap).max(380.0);
 
         // Main upper grid: [ Left Column (Thicken / Pair Spread) ] [ Center Column (Image / Tone) ] [ Right Column (Output) ]
@@ -591,7 +769,7 @@ impl ThickVoxEditor {
                     ui.horizontal_centered(|ui| {
                         let slot_w = ui.available_width() / 3.0;
                         ui.spacing_mut().item_spacing.x = 0.0;
-                        let knob_d = 62.0;
+                        let knob_d = 80.0;
 
                         ui.allocate_ui_with_layout(
                             egui::vec2(slot_w, ui.available_height()),
@@ -645,7 +823,7 @@ impl ThickVoxEditor {
                         ui.horizontal_centered(|ui| {
                             let slot_w = ui.available_width() / 4.0;
                             ui.spacing_mut().item_spacing.x = 0.0;
-                            let knob_d = 50.0;
+                            let knob_d = 80.0;
 
                             ui.allocate_ui_with_layout(
                                 egui::vec2(slot_w, ui.available_height()),
@@ -719,7 +897,7 @@ impl ThickVoxEditor {
                 // CARD 2: IMAGE
                 render_card(ui, "IMAGE", egui::vec2(col2_w, row_h), palette, |ui| {
                     ui.horizontal_centered(|ui| {
-                        let knob_d = 62.0;
+                        let knob_d = 80.0;
 
                         ui.allocate_ui_with_layout(
                             egui::vec2(ui.available_width() * 0.5, ui.available_height()),
@@ -754,7 +932,7 @@ impl ThickVoxEditor {
                 render_card(ui, "TONE", egui::vec2(col2_w, row_h), palette, |ui| {
                     ui.horizontal_centered(|ui| {
                         let slot_w = ui.available_width() * 0.5;
-                        let knob_d = 62.0;
+                        let knob_d = 80.0;
 
                         ui.allocate_ui_with_layout(
                             egui::vec2(slot_w, ui.available_height()),
@@ -932,6 +1110,36 @@ impl ThickVoxEditor {
                     self.toggle_ab(ctx);
                 }
 
+                // Save preset button
+                let save_btn = egui::Button::new(
+                    RichText::new("💾")
+                        .font(FontId::proportional(11.0))
+                        .color(VST_TEXT_MAIN),
+                )
+                .fill(Color32::from_rgba_unmultiplied(255, 255, 255, 8))
+                .stroke(Stroke::new(1.0_f32, VST_CARD_BORDER))
+                .corner_radius(CornerRadius::same(5))
+                .min_size(egui::vec2(28.0, 24.0));
+                if ui
+                    .add(save_btn)
+                    .on_hover_text("Save Preset as...")
+                    .clicked()
+                {
+                    let (name, cat) = if let Some(p) = self.bank.get(self.preset_index) {
+                        if p.is_user {
+                            (p.name.clone(), p.category.clone())
+                        } else {
+                            (format!("{} (User)", p.name), "User".to_string())
+                        }
+                    } else {
+                        ("My Vocal Preset".to_string(), "User".to_string())
+                    };
+                    self.save_name = name;
+                    self.save_category = cat;
+                    self.save_error = None;
+                    self.show_save_modal = true;
+                }
+
                 // Preset selector pill: < [Name] >
                 self.preset_navigator(ui, ctx, palette);
             });
@@ -974,20 +1182,23 @@ impl ThickVoxEditor {
         ctx: &PluginContext<ThickVoxParams>,
         _palette: &Palette,
     ) {
-        let bank = presets::factory_presets();
-        if bank.is_empty() {
+        if self.bank.is_empty() {
             return;
         }
 
-        self.preset_index = self.preset_index.min(bank.len() - 1);
-        self.applied_preset = self.applied_preset.min(bank.len() - 1);
+        self.preset_index = self.preset_index.min(self.bank.len() - 1);
+        self.applied_preset = self.applied_preset.min(self.bank.len() - 1);
 
-        if let Some(found) = bank.iter().position(|preset| presets::matches(preset, ctx)) {
+        if let Some(found) = self
+            .bank
+            .iter()
+            .position(|preset| presets::matches(preset, ctx))
+        {
             self.preset_index = found;
             self.applied_preset = found;
         }
 
-        let is_edited = !presets::matches(&bank[self.preset_index], ctx);
+        let is_edited = !presets::matches(&self.bank[self.preset_index], ctx);
 
         let frame = egui::Frame::NONE
             .fill(VST_CARD_BG)
@@ -1014,17 +1225,17 @@ impl ThickVoxEditor {
                     .clicked();
                 if prev {
                     let prev_idx = if self.preset_index == 0 {
-                        bank.len() - 1
+                        self.bank.len() - 1
                     } else {
                         self.preset_index - 1
                     };
                     self.preset_index = prev_idx;
                     self.applied_preset = prev_idx;
-                    presets::apply(&bank[prev_idx], ctx);
+                    presets::apply(&self.bank[prev_idx], ctx);
                 }
 
                 // Preset Name Dropdown
-                let mut current_name = bank[self.preset_index].name.clone();
+                let mut current_name = self.bank[self.preset_index].name.clone();
                 if is_edited {
                     current_name.push_str(" *");
                 }
@@ -1038,13 +1249,40 @@ impl ThickVoxEditor {
                     )
                     .width(135.0)
                     .show_ui(ui, |ui| {
-                        for (idx, preset) in bank.iter().enumerate() {
-                            let mut selected = self.preset_index == idx;
-                            let label = format!("{}  ·  {}", preset.name, preset.category);
-                            if ui.selectable_value(&mut selected, true, label).clicked() {
-                                self.preset_index = idx;
-                                self.applied_preset = idx;
-                                presets::apply(preset, ctx);
+                        let has_user = self.bank.iter().any(|p| p.is_user);
+
+                        // Factory presets
+                        for (idx, preset) in self.bank.iter().enumerate() {
+                            if !preset.is_user {
+                                let mut selected = self.preset_index == idx;
+                                let label = format!("{}  ·  {}", preset.name, preset.category);
+                                if ui.selectable_value(&mut selected, true, label).clicked() {
+                                    self.preset_index = idx;
+                                    self.applied_preset = idx;
+                                    presets::apply(preset, ctx);
+                                }
+                            }
+                        }
+
+                        // User presets section
+                        if has_user {
+                            ui.separator();
+                            ui.label(
+                                RichText::new("USER PRESETS")
+                                    .font(FontId::proportional(9.5))
+                                    .color(VST_EMERALD)
+                                    .strong(),
+                            );
+                            for (idx, preset) in self.bank.iter().enumerate() {
+                                if preset.is_user {
+                                    let mut selected = self.preset_index == idx;
+                                    let label = format!("{}  ·  {}", preset.name, preset.category);
+                                    if ui.selectable_value(&mut selected, true, label).clicked() {
+                                        self.preset_index = idx;
+                                        self.applied_preset = idx;
+                                        presets::apply(preset, ctx);
+                                    }
+                                }
                             }
                         }
                     });
@@ -1063,10 +1301,10 @@ impl ThickVoxEditor {
                     )
                     .clicked();
                 if next {
-                    let next_idx = (self.preset_index + 1) % bank.len();
+                    let next_idx = (self.preset_index + 1) % self.bank.len();
                     self.preset_index = next_idx;
                     self.applied_preset = next_idx;
-                    presets::apply(&bank[next_idx], ctx);
+                    presets::apply(&self.bank[next_idx], ctx);
                 }
             });
         });
