@@ -360,10 +360,7 @@ impl PluginLogic for ThickVox {
     // vocal and destroy the intended ADT offset.
 
     fn editor(params: Arc<ThickVoxParams>) -> Box<dyn Editor> {
-        Box::new(
-            EguiEditor::with_ui(params, (1020, 650), ThickVoxEditor::new())
-                .resizable(false),
-        )
+        Box::new(EguiEditor::with_ui(params, (1020, 650), ThickVoxEditor::new()).resizable(false))
     }
 }
 
