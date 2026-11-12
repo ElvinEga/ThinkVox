@@ -1,13 +1,30 @@
 //! The 8-voice engine + Mid/Side wet stage.
+//!
+//! The wet chain is now two clearly separated stages:
+//!
+//! ```text
+//!   mono sum --> DelayStage (10 / 24 ms ADT offsets)
+//!                    |--> GrainHistory[short] --+
+//!                    |--> GrainHistory[long]  --+--> 8 x MicroPitchShifter
+//!                                                        |
+//!                                          per-pair pan -> wet L / wet R
+//!                                                        |
+//!                           M/S -> Side HPF -> Side Air -> Width -> Mix
+//! ```
+//!
+//! The delay stage never sees a pitch ratio and the pitch stage never sees a
+//! millisecond value. `DelayStage` subtracts the pitch stage's mean
+//! read-back so the classic 10 / 24 ms offsets are preserved at the output.
 
-use super::delay::DelayLine;
+use super::delay::{DelayLine, DelayStage};
 use super::filter::OnePole;
+use super::pitch_shifter::PitchConfig;
 use super::voice::{VOICE_SPECS, Voice};
 use core::f32::consts::{FRAC_1_SQRT_2, FRAC_PI_4};
 
-/// Buffer capacity in seconds. Worst case is 24 ms * 1.3 spread = 31.2 ms
-/// plus half a 12 ms grain, so 80 ms leaves plenty of headroom even at
-/// 192 kHz.
+/// Buffer capacity in seconds for the shared input history. Worst case is
+/// 24 ms * 1.3 spread = 31.2 ms (before pitch-latency compensation), so
+/// 80 ms leaves plenty of headroom even at 192 kHz.
 pub const MAX_DELAY_S: f32 = 0.080;
 
 /// Fixed corner for the Side-only "Air" shelf.
@@ -58,6 +75,14 @@ impl Settings {
     }
 }
 
+/// Stage 1 delay in milliseconds after compensating for the pitch stage's
+/// mean read-back. The floor keeps the cubic interpolator well behind the
+/// write pointer at every Delay Spread setting.
+#[inline]
+pub fn doubling_delay_ms(nominal_ms: f32, spread: f32, pitch_latency_ms: f32) -> f32 {
+    (nominal_ms * spread - pitch_latency_ms).max(1.0)
+}
+
 /// Constant-power pan gains for the **left** voice of a pair.
 ///
 /// `spread = 1` gives `(1, 0)` (hard left), `spread = 0` gives
@@ -82,9 +107,13 @@ pub fn decode_ms(mid: f32, side: f32) -> (f32, f32) {
 }
 
 pub struct Thickener {
-    /// Shared input history for all 8 voices.
-    line: DelayLine,
+    /// Stage 1: shared input history for the ADT doubling delay.
+    delay: DelayStage,
+    /// Stage 2: one grain history per ADT delay group (10 ms / 24 ms).
+    /// Four voices share each history; only their read heads differ.
+    hist: [DelayLine; 2],
     voices: [Voice; 8],
+    cfg: PitchConfig,
     /// Side highpass state.
     tone_hp: OnePole,
     /// Side air shelf state.
@@ -104,17 +133,22 @@ impl Default for Thickener {
 
 impl Thickener {
     pub fn new(sr: f32) -> Self {
+        let cfg = PitchConfig::new(sr);
+        let sr = cfg.sample_rate();
+        let input_cap = (MAX_DELAY_S * sr).ceil() as usize + 8;
+        let grain_cap = cfg.history_capacity();
         let mut this = Self {
-            // Placeholder; `prepare` sizes it for the real sample rate.
-            line: DelayLine::new(16),
-            voices: core::array::from_fn(|i| Voice::new(VOICE_SPECS[i], i)),
+            delay: DelayStage::new(input_cap),
+            hist: core::array::from_fn(|_| DelayLine::new(grain_cap)),
+            voices: core::array::from_fn(|i| Voice::new(VOICE_SPECS[i], i, &cfg)),
+            cfg,
             tone_hp: OnePole::default(),
             air_shelf: OnePole::default(),
             last_pair_spread: [f32::NAN; 4],
             pair_pan: [(1.0, 0.0); 4],
-            sr: 0.0,
+            sr,
         };
-        this.prepare(sr);
+        this.clear();
         this
     }
 
@@ -122,9 +156,13 @@ impl Thickener {
     /// the sample rate actually changed, then clears all DSP memory.
     pub fn prepare(&mut self, sr: f32) {
         let sr = sr.clamp(8_000.0, 384_000.0);
-        let cap = (MAX_DELAY_S * sr).ceil() as usize + 8;
-        if self.line.capacity() < cap || (self.sr - sr).abs() > 0.5 {
-            self.line = DelayLine::new(cap);
+        if (self.sr - sr).abs() > 0.5 {
+            let cfg = PitchConfig::new(sr);
+            let input_cap = (MAX_DELAY_S * sr).ceil() as usize + 8;
+            let grain_cap = cfg.history_capacity();
+            self.delay = DelayStage::new(input_cap);
+            self.hist = core::array::from_fn(|_| DelayLine::new(grain_cap));
+            self.cfg = cfg;
             self.sr = sr;
         }
         self.clear();
@@ -134,11 +172,28 @@ impl Thickener {
         self.sr
     }
 
-    /// Clear delay lines, sweep phases and filter state.
+    /// Mean read-back contributed by the pitch stage (milliseconds).
+    pub fn pitch_latency_ms(&self) -> f32 {
+        self.cfg.mean_latency_ms()
+    }
+
+    /// Exposed for diagnostics / tests.
+    pub fn input_delay_capacity(&self) -> usize {
+        self.delay.capacity()
+    }
+
+    pub fn grain_history_capacity(&self) -> usize {
+        self.hist[0].capacity()
+    }
+
+    /// Clear delay lines, sweep phases, pan cache and filter state.
     pub fn clear(&mut self) {
-        self.line.clear();
+        self.delay.clear();
+        for h in &mut self.hist {
+            h.clear();
+        }
         for (i, v) in self.voices.iter_mut().enumerate() {
-            v.reset(i);
+            v.reset(i, &self.cfg);
         }
         self.tone_hp.reset();
         self.air_shelf.reset();
@@ -154,9 +209,19 @@ impl Thickener {
         // double-feed any one side. A mono bus is fanned to L=R by the host
         // adapter, which also reproduces the mono sum exactly.
         let mono = (in_l + in_r) * 0.5;
-        self.line.push(mono);
-
         let sr = self.sr;
+
+        // ---- Stage 1: ADT doubling delay ---------------------------------
+        self.delay.push(mono);
+        let comp = self.cfg.mean_latency_ms();
+        let short_ms = doubling_delay_ms(10.0, s.delay_spread, comp);
+        let long_ms = doubling_delay_ms(24.0, s.delay_spread, comp);
+        let delayed_short = self.delay.read_ms(short_ms, sr);
+        let delayed_long = self.delay.read_ms(long_ms, sr);
+
+        // ---- Stage 2: independent granular micro pitch -------------------
+        self.hist[0].push(delayed_short);
+        self.hist[1].push(delayed_long);
 
         // Four trig calls only when a spread is actually moving; zero in
         // steady state. Spreads are smoothed upstream, so this is both
@@ -170,6 +235,8 @@ impl Thickener {
         }
         let pan = self.pair_pan;
 
+        let hist = &self.hist;
+        let cfg = &self.cfg;
         let mut wet_l = 0.0_f32;
         let mut wet_r = 0.0_f32;
         // Un-panned voice sum. Mid Only mode uses this instead of `mid`, so
@@ -177,7 +244,7 @@ impl Thickener {
         // spread knob is moved (hard pan would otherwise be 3 dB down).
         let mut voice_sum = 0.0_f32;
         for (idx, v) in self.voices.iter_mut().enumerate() {
-            let y = v.render(&self.line, s.detune_depth, s.delay_spread, sr) * s.voice_gain;
+            let y = v.head.process(&hist[v.group], v.cents(s.detune_depth), cfg) * s.voice_gain;
             voice_sum += y;
             let (l, r) = pan[idx / 2];
             let (pl, pr) = if v.hard_left() { (l, r) } else { (r, l) };
@@ -243,10 +310,38 @@ mod tests {
             let (l2, r2) = decode_ms(m, s);
             assert!((l - l2).abs() < 1e-7 && (r - r2).abs() < 1e-7);
         }
-        // Pure mono produces zero Side energy.
         let (m, s) = encode_ms(0.8, 0.8);
         assert!((m - 0.8).abs() < 1e-7);
         assert!(s.abs() < 1e-7);
+    }
+
+    #[test]
+    fn delay_stage_compensates_pitch_latency() {
+        let t = Thickener::new(48_000.0);
+        let comp = t.pitch_latency_ms();
+        assert!(comp > 1.0 && comp < 20.0, "unexpected pitch latency {comp}");
+        for spread in [0.7_f32, 1.0, 1.3] {
+            for nominal in [10.0_f32, 24.0] {
+                let stage1 = doubling_delay_ms(nominal, spread, comp);
+                // Total wet offset (stage 1 + mean stage 2) is the classic
+                // Huart delay, except where the 1 ms safety floor applies.
+                let total = stage1 + comp;
+                assert!(
+                    (total - nominal * spread).abs() < 0.01 || stage1 == 1.0,
+                    "spread={spread} nominal={nominal}: {total}"
+                );
+                assert!(total <= 32.0, "wet offset left the doubling band");
+            }
+        }
+    }
+
+    #[test]
+    fn stage_buffers_are_sized_independently() {
+        let t = Thickener::new(48_000.0);
+        // Two grain histories, not eight: four voices share each.
+        assert_eq!(t.hist.len(), 2);
+        assert!(t.grain_history_capacity() > t.cfg.max_offset as usize);
+        assert!(t.input_delay_capacity() >= (MAX_DELAY_S * 48_000.0) as usize);
     }
 
     #[test]
@@ -294,8 +389,6 @@ mod tests {
 
     #[test]
     fn mid_only_level_is_independent_of_pair_spread() {
-        // Mid Only folds the wet bus to the centre, so narrowing pairs must
-        // not change its level. The old `mid * SQRT_2` form drifted ~3 dB.
         let input = sine(48_000.0, 220.0, 8192);
         let mut settings = Settings::neutral();
         settings.mid_only = true;
@@ -369,7 +462,6 @@ mod tests {
 
     #[test]
     fn each_pair_spread_changes_the_output() {
-        // A single pair's knob must actually reach the DSP.
         let input = sine(48_000.0, 220.0, 8192);
         let mut baseline = Thickener::new(48_000.0);
         let base = Settings::neutral();
@@ -386,6 +478,25 @@ mod tests {
                 .fold(0.0_f32, |m, (a, b)| m.max((a - b).abs()));
             assert!(max_diff > 1e-4, "pair {p} spread had no effect");
         }
+    }
+
+    #[test]
+    fn long_run_stays_clean_across_many_wraps() {
+        // 20 s at 48 kHz: every voice wraps its grain window several times.
+        let sr = 48_000.0;
+        let mut t = Thickener::new(sr);
+        let s = Settings::neutral();
+        let mut max_step = 0.0_f32;
+        let mut prev = (0.0_f32, 0.0_f32);
+        for n in 0..(sr as usize * 20) {
+            let x = (2.0 * PI * 220.0 * n as f32 / sr).sin();
+            let (l, r) = t.process_sample(x, x, &s);
+            assert!(l.is_finite() && r.is_finite(), "non-finite at {n}");
+            assert!(l.abs() < 3.0 && r.abs() < 3.0, "runaway at {n}");
+            max_step = max_step.max((l - prev.0).abs()).max((r - prev.1).abs());
+            prev = (l, r);
+        }
+        assert!(max_step < 0.3, "wrap discontinuity: {max_step}");
     }
 
     #[test]
@@ -413,10 +524,11 @@ mod tests {
     #[test]
     fn sample_rate_change_rebuilds_and_clears() {
         let mut t = Thickener::new(48_000.0);
-        let cap_48 = t.line.capacity();
+        let cap_48 = t.grain_history_capacity();
         t.prepare(96_000.0);
         assert_eq!(t.sample_rate(), 96_000.0);
-        assert!(t.line.capacity() > cap_48);
+        assert!(t.grain_history_capacity() > cap_48);
+        assert!(t.input_delay_capacity() > (MAX_DELAY_S * 48_000.0) as usize);
         let s = Settings::neutral();
         let (l, r) = t.render_mono_block(&sine(96_000.0, 440.0, 1000), &s);
         assert!(l.iter().chain(r.iter()).all(|x| x.is_finite()));
