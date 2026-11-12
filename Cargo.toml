@@ -30,11 +30,14 @@ rt-paranoid = ["truce/rt-paranoid"]
 
 [dependencies]
 truce = { version = "6.3" }
-# Lightweight types for layout / theme / widget descriptions.
-truce-gui-types = { version = "6.3" }
-# Built-in renderer. Plugins that supply their own editor (egui /
-# iced / slint) can drop this dep.
-truce-gui = { version = "6.3" }
+# Custom editor: egui backend + NodaAudio widgets (knobs, fader, meters).
+truce-egui = { version = "6.3" }
+egui = "0.34"
+# Pinned to the local side-by-side checkout so the component library alone
+# can be linked. `default-features = false` also disables its reference
+# demo plugin, whose `truce::plugin!` FFI exports would otherwise collide
+# with ThickVox's own `truce_process` / `truce_build_editor` symbols.
+noda-audio = { path = "../NodaAudio", default-features = false }
 truce-clap = { version = "6.3", optional = true }
 truce-vst3 = { version = "6.3", optional = true }
 truce-standalone = { version = "6.3", features = ["gui"], optional = true }
