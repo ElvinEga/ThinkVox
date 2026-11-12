@@ -361,10 +361,10 @@ impl PluginLogic for ThickVox {
 
     fn editor(params: Arc<ThickVoxParams>) -> Box<dyn Editor> {
         Box::new(
-            EguiEditor::with_ui(params, (1280, 780), ThickVoxEditor::new())
+            EguiEditor::with_ui(params, (900, 600), ThickVoxEditor::new())
                 .resizable(true)
-                .min_size((1020, 640))
-                .max_size((2400, 1500)),
+                .min_size((820, 540))
+                .max_size((1800, 1200)),
         )
     }
 }
