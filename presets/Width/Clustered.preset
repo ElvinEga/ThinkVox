@@ -1,0 +1,19 @@
+uuid = "50c05c0a-c2ae-4197-8380-0b7d2fb40c02"
+name = "Clustered"
+author = "ThickVox Audio"
+comment = "Every pair at half spread: voices gather around +/-45 degrees for a tight, solid image."
+tags = ["tight", "mono-safe"]
+
+[params]
+0 = 0.35
+1 = 1.0
+2 = 1.0
+4 = 1.0
+5 = -8.0
+6 = 130.0
+7 = 1.2
+8 = false
+10 = 0.5
+11 = 0.5
+12 = 0.5
+13 = 0.5
