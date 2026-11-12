@@ -746,7 +746,7 @@ impl ThickVoxEditor {
         let avail_h = ui.available_height();
 
         let bottom_tray_h = 136.0_f32;
-        let gap = 4.0_f32;
+        let gap = 6.0_f32;
         let upper_grid_h = (avail_h - bottom_tray_h - gap).max(380.0);
 
         // Main upper grid: [ Left Column (Thicken / Pair Spread) ] [ Center Column (Image / Tone) ] [ Right Column (Output) ]
