@@ -1,0 +1,26 @@
+# Rust build artifacts
+audiocn
+/target/
+**/*.rs.bk
+*.pdb
+
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+.Spotlight-V100
+.Trashes
+*.iconset/
+
+# Editor & IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logs and crash dumps
+*.log
+*.crash

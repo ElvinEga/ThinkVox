@@ -1,0 +1,15 @@
+[vendor]
+name = "ThickVox Audio"
+id = "com.thickvox"
+url = "https://example.com"
+au_manufacturer = "TAud"
+
+[[plugin]]
+name = "ThickVox"
+bundle_id = "thickvox"
+crate = "thickvox"
+category = "effect"
+fourcc = "ThVx"
+au_tag = "Effects"
+# Micro-pitch / short-delay doubling belongs in the modulation bucket.
+vst3_subcategory = "Modulation"
