@@ -1,0 +1,19 @@
+uuid = "c1417a52-8bb6-4227-9997-a692326609f5"
+name = "Centred Thickness"
+author = "ThickVox Audio"
+comment = "Voices clustered at the centre: dense, mono-safe, and level-matched to the wide preset."
+tags = ["mono-safe", "thick"]
+
+[params]
+0 = 0.4
+1 = 1.0
+2 = 1.05
+4 = 1.0
+5 = -8.0
+6 = 150.0
+7 = 1.0
+8 = false
+10 = 0.12
+11 = 0.12
+12 = 0.12
+13 = 0.12
