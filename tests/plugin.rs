@@ -202,6 +202,46 @@ fn all_pair_pans_centred_folds_to_mono() {
     assert!(max_diff < 1e-5, "centred pairs should be mono: {max_diff}");
 }
 
+/// The editor's meter lanes must actually receive the post-mix peaks.
+#[test]
+fn process_publishes_stereo_meters() {
+    use thickvox::ThickVoxParams;
+    use truce_test::MeterCapture;
+
+    let params = ThickVoxParams::default();
+    let result = driver!(Plugin)
+        .sample_rate(48_000.0)
+        .channels(2)
+        .duration(Duration::from_millis(100))
+        .input(tone())
+        .capture_meters(MeterCapture::Final)
+        .run();
+
+    assertions::assert_meter_above(&result, params.meter_l.id(), 0.01);
+    assertions::assert_meter_above(&result, params.meter_r.id(), 0.01);
+}
+
+/// Bypass must still feed the meters, because the editor shows the bus
+/// that is actually leaving the plugin.
+#[test]
+fn bypass_still_publishes_meters() {
+    use thickvox::ThickVoxParams;
+    use truce_test::MeterCapture;
+
+    let params = ThickVoxParams::default();
+    let result = driver!(Plugin)
+        .sample_rate(48_000.0)
+        .channels(2)
+        .duration(Duration::from_millis(50))
+        .input(InputSource::Constant(0.5))
+        .set_param(P::Bypass, 1.0)
+        .capture_meters(MeterCapture::Final)
+        .run();
+
+    assertions::assert_meter_above(&result, params.meter_l.id(), 0.4);
+    assertions::assert_meter_above(&result, params.meter_r.id(), 0.4);
+}
+
 #[cfg(feature = "rt-paranoid")]
 #[test]
 fn process_never_allocates() {
