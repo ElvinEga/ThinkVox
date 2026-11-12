@@ -3,7 +3,7 @@
 use super::delay::DelayLine;
 use super::filter::OnePole;
 use super::voice::{VOICE_SPECS, Voice};
-use core::f32::consts::{FRAC_PI_4, SQRT_2};
+use core::f32::consts::{FRAC_1_SQRT_2, FRAC_PI_4};
 
 /// Buffer capacity in seconds. Worst case is 24 ms * 1.3 spread = 31.2 ms
 /// plus half a 12 ms grain, so 80 ms leaves plenty of headroom even at
@@ -172,8 +172,13 @@ impl Thickener {
 
         let mut wet_l = 0.0_f32;
         let mut wet_r = 0.0_f32;
+        // Un-panned voice sum. Mid Only mode uses this instead of `mid`, so
+        // folding the image to the centre cannot change level when a pair
+        // spread knob is moved (hard pan would otherwise be 3 dB down).
+        let mut voice_sum = 0.0_f32;
         for (idx, v) in self.voices.iter_mut().enumerate() {
             let y = v.render(&self.line, s.detune_depth, s.delay_spread, sr) * s.voice_gain;
+            voice_sum += y;
             let (l, r) = pan[idx / 2];
             let (pl, pr) = if v.hard_left() { (l, r) } else { (r, l) };
             wet_l += y * pl;
@@ -192,9 +197,11 @@ impl Thickener {
 
         if s.mid_only {
             // Centred thickness: all voices into Mid, no Side energy.
-            // Scaling by SQRT_2 matches what a fully centred pan law would
-            // have produced, so toggling the switch preserves loudness.
-            let m = mid * SQRT_2 * mix;
+            // Drive it from the un-panned voice sum at 1/sqrt(2), i.e. what a
+            // fully centred constant-power pan law would have produced. This
+            // keeps the level identical to the default hard-panned setting and
+            // makes the mode immune to the four pair spread knobs.
+            let m = voice_sum * FRAC_1_SQRT_2 * mix;
             (m, m)
         } else {
             let side = side_eq * s.width.max(0.0);
@@ -282,6 +289,31 @@ mod tests {
         let (l, r) = t.render_mono_block(&input, &s);
         for i in 0..input.len() {
             assert!((l[i] - r[i]).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn mid_only_level_is_independent_of_pair_spread() {
+        // Mid Only folds the wet bus to the centre, so narrowing pairs must
+        // not change its level. The old `mid * SQRT_2` form drifted ~3 dB.
+        let input = sine(48_000.0, 220.0, 8192);
+        let mut settings = Settings::neutral();
+        settings.mid_only = true;
+
+        let mut hard = Thickener::new(48_000.0);
+        let (hard_l, _) = hard.render_mono_block(&input, &settings);
+
+        settings.pair_spread = [0.0; 4];
+        let mut centred = Thickener::new(48_000.0);
+        let (centred_l, _) = centred.render_mono_block(&input, &settings);
+
+        for i in 0..input.len() {
+            assert!(
+                (hard_l[i] - centred_l[i]).abs() < 1e-6,
+                "frame {i}: {} vs {}",
+                hard_l[i],
+                centred_l[i]
+            );
         }
     }
 
