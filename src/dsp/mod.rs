@@ -8,7 +8,7 @@
 //!        +--> shared DelayLine --> [8 x Voice: granular micro-pitch + short delay]
 //!                                        |
 //!                                        v
-//!                              wet L / wet R (hard-panned voices)
+//!                              wet L / wet R (per-pair pan spread)
 //!                                        |
 //!                              encode M/S -> Side HPF -> Side air shelf
 //!                                        |
